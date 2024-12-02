@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "td/db/MemoryKeyValue.h"
 
@@ -28,6 +28,24 @@ Result<MemoryKeyValue::GetStatus> MemoryKeyValue::get(Slice key, std::string &va
   }
   value = it->second;
   return GetStatus::Ok;
+}
+
+Status MemoryKeyValue::for_each(std::function<Status(Slice, Slice)> f) {
+  for (auto &it : map_) {
+    TRY_STATUS(f(it.first, it.second));
+  }
+  return Status::OK();
+}
+
+Status MemoryKeyValue::for_each_in_range(Slice begin, Slice end, std::function<Status(Slice, Slice)> f) {
+  for (auto it = map_.lower_bound(begin); it != map_.end(); it++) {
+    if (it->first < end) {
+      TRY_STATUS(f(it->first, it->second));
+    } else {
+      break;
+    }
+  }
+  return Status::OK();
 }
 Status MemoryKeyValue::set(Slice key, Slice value) {
   map_[key.str()] = value.str();
@@ -60,6 +78,15 @@ std::unique_ptr<KeyValueReader> MemoryKeyValue::snapshot() {
 
 std::string MemoryKeyValue::stats() const {
   return PSTRING() << "MemoryKeyValueStats{" << tag("get_count", get_count_) << "}";
+}
+Status MemoryKeyValue::begin_write_batch() {
+  UNREACHABLE();
+}
+Status MemoryKeyValue::commit_write_batch() {
+  UNREACHABLE();
+}
+Status MemoryKeyValue::abort_write_batch() {
+  UNREACHABLE();
 }
 
 Status MemoryKeyValue::begin_transaction() {

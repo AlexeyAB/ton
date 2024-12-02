@@ -14,15 +14,17 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "vm/cells/Cell.h"
+#include "td/utils/buffer.h"
 
 #include <utility>
 #include <functional>
 
 namespace vm {
+
 class MerkleProof {
  public:
   using IsPrunnedFunction = std::function<bool(const Ref<Cell> &)>;
@@ -36,11 +38,38 @@ class MerkleProof {
   static Ref<Cell> virtualize(Ref<Cell> cell, int virtualization);
 
   static Ref<Cell> combine(Ref<Cell> a, Ref<Cell> b);
+  static td::Result<Ref<Cell>> combine_status(Ref<Cell> a, Ref<Cell> b);
+  static Ref<Cell> combine_fast(Ref<Cell> a, Ref<Cell> b);
+  static td::Result<Ref<Cell>> combine_fast_status(Ref<Cell> a, Ref<Cell> b);
 
   // works with upwrapped proofs
   // works fine with cell of non-zero level, but this is not supported (yet?) in MerkeProof special cell
   static Ref<Cell> generate_raw(Ref<Cell> cell, IsPrunnedFunction is_prunned);
   static Ref<Cell> generate_raw(Ref<Cell> cell, CellUsageTree *usage_tree);
   static Ref<Cell> virtualize_raw(Ref<Cell> cell, Cell::VirtualizationParameters virt);
+  static Ref<Cell> combine_raw(Ref<Cell> a, Ref<Cell> b);
+  static Ref<Cell> combine_fast_raw(Ref<Cell> a, Ref<Cell> b);
 };
+
+class MerkleProofBuilder {
+  std::shared_ptr<CellUsageTree> usage_tree;
+  Ref<vm::Cell> orig_root, usage_root;
+
+ public:
+  MerkleProofBuilder() = default;
+  MerkleProofBuilder(Ref<Cell> root);
+  Ref<Cell> init(Ref<Cell> root);
+  bool clear();
+  Ref<Cell> root() const {
+    return usage_root;
+  }
+  td::Result<Ref<Cell>> extract_proof() const;
+  bool extract_proof_to(Ref<Cell> &proof_root) const;
+  td::Result<td::BufferSlice> extract_proof_boc() const;
+
+  void set_cell_load_callback(std::function<void(const td::Ref<vm::DataCell>&)> f) {
+    usage_tree->set_cell_load_callback(std::move(f));
+  }
+};
+
 }  // namespace vm

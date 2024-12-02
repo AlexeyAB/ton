@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "fabric.h"
 #include "collator-impl.h"
@@ -33,13 +33,21 @@
 #include "top-shard-descr.hpp"
 #include "ton/ton-io.hpp"
 #include "liteserver.hpp"
+#include "validator/fabric.h"
+#include "liteserver-cache.hpp"
 
 namespace ton {
 
 namespace validator {
 
-td::actor::ActorOwn<Db> create_db_actor(td::actor::ActorId<ValidatorManager> manager, std::string db_root_) {
-  return td::actor::create_actor<RootDb>("db", manager, db_root_);
+td::actor::ActorOwn<Db> create_db_actor(td::actor::ActorId<ValidatorManager> manager, std::string db_root_,
+                                        td::Ref<ValidatorManagerOptions> opts) {
+  return td::actor::create_actor<RootDb>("db", manager, db_root_, opts);
+}
+
+td::actor::ActorOwn<LiteServerCache> create_liteserver_cache_actor(td::actor::ActorId<ValidatorManager> manager,
+                                                                   std::string db_root) {
+  return td::actor::create_actor<LiteServerCacheImpl>("cache");
 }
 
 td::Result<td::Ref<BlockData>> create_block(BlockIdExt block_id, td::BufferSlice data) {
@@ -86,6 +94,14 @@ td::Result<td::Ref<ShardState>> create_shard_state(BlockIdExt block_id, td::Ref<
 }
 
 td::Result<BlockHandle> create_block_handle(td::BufferSlice data) {
+  return ton::validator::BlockHandleImpl::create(data.as_slice());
+}
+
+td::Result<BlockHandle> create_block_handle(td::Slice data) {
+  return ton::validator::BlockHandleImpl::create(data);
+}
+
+td::Result<ConstBlockHandle> create_temp_block_handle(td::BufferSlice data) {
   return ton::validator::BlockHandleImpl::create(std::move(data));
 }
 
@@ -97,9 +113,15 @@ td::Ref<BlockSignatureSet> create_signature_set(std::vector<BlockSignature> sig_
   return td::Ref<BlockSignatureSetQ>{true, std::move(sig_set)};
 }
 
-td::Result<td::Ref<ExtMessage>> create_ext_message(td::BufferSlice data) {
-  TRY_RESULT(res, ExtMessageQ::create_ext_message(std::move(data)));
+td::Result<td::Ref<ExtMessage>> create_ext_message(td::BufferSlice data,
+                                                   block::SizeLimitsConfig::ExtMsgLimits limits) {
+  TRY_RESULT(res, ExtMessageQ::create_ext_message(std::move(data), limits));
   return std::move(res);
+}
+
+void run_check_external_message(Ref<ExtMessage> message, td::actor::ActorId<ValidatorManager> manager,
+                                td::Promise<td::Ref<ExtMessage>> promise) {
+  ExtMessageQ::run_message(std::move(message), std::move(manager), std::move(promise));
 }
 
 td::Result<td::Ref<IhrMessage>> create_ihr_message(td::BufferSlice data) {
@@ -109,10 +131,11 @@ td::Result<td::Ref<IhrMessage>> create_ihr_message(td::BufferSlice data) {
 
 void run_accept_block_query(BlockIdExt id, td::Ref<BlockData> data, std::vector<BlockIdExt> prev,
                             td::Ref<ValidatorSet> validator_set, td::Ref<BlockSignatureSet> signatures,
-                            td::Ref<BlockSignatureSet> approve_signatures, bool send_broadcast,
+                            td::Ref<BlockSignatureSet> approve_signatures, int send_broadcast_mode,
                             td::actor::ActorId<ValidatorManager> manager, td::Promise<td::Unit> promise) {
-  td::actor::create_actor<AcceptBlockQuery>("accept", id, std::move(data), prev, std::move(validator_set),
-                                            std::move(signatures), send_broadcast, manager, std::move(promise))
+  td::actor::create_actor<AcceptBlockQuery>(
+      PSTRING() << "accept" << id.id.to_str(), id, std::move(data), prev, std::move(validator_set),
+      std::move(signatures), std::move(approve_signatures), send_broadcast_mode, manager, std::move(promise))
       .release();
 }
 
@@ -125,10 +148,18 @@ void run_fake_accept_block_query(BlockIdExt id, td::Ref<BlockData> data, std::ve
       .release();
 }
 
-void run_apply_block_query(BlockIdExt id, td::Ref<BlockData> block, td::actor::ActorId<ValidatorManager> manager,
-                           td::Timestamp timeout, td::Promise<td::Unit> promise) {
-  td::actor::create_actor<ApplyBlock>(PSTRING() << "apply " << id, id, std::move(block), manager, timeout,
-                                      std::move(promise))
+void run_hardfork_accept_block_query(BlockIdExt id, td::Ref<BlockData> data,
+                                     td::actor::ActorId<ValidatorManager> manager, td::Promise<td::Unit> promise) {
+  td::actor::create_actor<AcceptBlockQuery>("fork/accept", AcceptBlockQuery::ForceFork(), id, std::move(data),
+                                            std::move(manager), std::move(promise))
+      .release();
+}
+
+void run_apply_block_query(BlockIdExt id, td::Ref<BlockData> block, BlockIdExt masterchain_block_id,
+                           td::actor::ActorId<ValidatorManager> manager, td::Timestamp timeout,
+                           td::Promise<td::Unit> promise) {
+  td::actor::create_actor<ApplyBlock>(PSTRING() << "apply " << id, id, std::move(block), masterchain_block_id, manager,
+                                      timeout, std::move(promise))
       .release();
 }
 
@@ -161,7 +192,7 @@ void run_check_proof_link_query(BlockIdExt id, td::Ref<ProofLink> proof, td::act
       .release();
 }
 
-void run_validate_query(ShardIdFull shard, UnixTime min_ts, BlockIdExt min_masterchain_block_id,
+void run_validate_query(ShardIdFull shard, BlockIdExt min_masterchain_block_id,
                         std::vector<BlockIdExt> prev, BlockCandidate candidate, td::Ref<ValidatorSet> validator_set,
                         td::actor::ActorId<ValidatorManager> manager, td::Timestamp timeout,
                         td::Promise<ValidateCandidateResult> promise, bool is_fake) {
@@ -171,32 +202,58 @@ void run_validate_query(ShardIdFull shard, UnixTime min_ts, BlockIdExt min_maste
       seqno = p.seqno();
     }
   }
-  td::actor::create_actor<ValidateQuery>(
-      PSTRING() << (is_fake ? "fakevalidate" : "validateblock") << shard.to_str() << ":" << (seqno + 1), shard, min_ts,
-      min_masterchain_block_id, std::move(prev), std::move(candidate), std::move(validator_set), std::move(manager),
-      timeout, std::move(promise), is_fake)
+  static std::atomic<size_t> idx;
+  td::actor::create_actor<ValidateQuery>(PSTRING() << (is_fake ? "fakevalidate" : "validateblock") << shard.to_str()
+                                                   << ":" << (seqno + 1) << "#" << idx.fetch_add(1),
+                                         shard, min_masterchain_block_id, std::move(prev), std::move(candidate),
+                                         std::move(validator_set), std::move(manager), timeout, std::move(promise),
+                                         is_fake)
       .release();
 }
 
-void run_collate_query(ShardIdFull shard, td::uint32 min_ts, const BlockIdExt& min_masterchain_block_id,
-                       std::vector<BlockIdExt> prev, PublicKeyHash collator_id, td::Ref<ValidatorSet> validator_set,
-                       td::actor::ActorId<ValidatorManager> manager, td::Timestamp timeout,
-                       td::Promise<BlockCandidate> promise) {
+void run_collate_query(ShardIdFull shard, const BlockIdExt& min_masterchain_block_id, std::vector<BlockIdExt> prev,
+                       Ed25519_PublicKey creator, td::Ref<ValidatorSet> validator_set,
+                       td::Ref<CollatorOptions> collator_opts, td::actor::ActorId<ValidatorManager> manager,
+                       td::Timestamp timeout, td::Promise<BlockCandidate> promise,
+                       td::CancellationToken cancellation_token, unsigned mode, int attempt_idx) {
   BlockSeqno seqno = 0;
   for (auto& p : prev) {
     if (p.seqno() > seqno) {
       seqno = p.seqno();
     }
   }
-  td::actor::create_actor<Collator>(PSTRING() << "collate" << shard.to_str() << ":" << (seqno + 1), shard, min_ts,
-                                    min_masterchain_block_id, std::move(prev), std::move(validator_set),
-                                    collator_id.bits256_value(), std::move(manager), timeout, std::move(promise))
+  td::actor::create_actor<Collator>(PSTRING() << "collate" << shard.to_str() << ":" << (seqno + 1)
+                                              << (attempt_idx ? "_" + td::to_string(attempt_idx) : ""),
+                                    shard, false, min_masterchain_block_id, std::move(prev), std::move(validator_set),
+                                    creator, std::move(collator_opts), std::move(manager), timeout, std::move(promise),
+                                    std::move(cancellation_token), mode, attempt_idx)
+      .release();
+}
+
+void run_collate_hardfork(ShardIdFull shard, const BlockIdExt& min_masterchain_block_id, std::vector<BlockIdExt> prev,
+                          td::actor::ActorId<ValidatorManager> manager, td::Timestamp timeout,
+                          td::Promise<BlockCandidate> promise) {
+  BlockSeqno seqno = 0;
+  for (auto& p : prev) {
+    if (p.seqno() > seqno) {
+      seqno = p.seqno();
+    }
+  }
+  td::actor::create_actor<Collator>(PSTRING() << "collate" << shard.to_str() << ":" << (seqno + 1), shard, true,
+                                    min_masterchain_block_id, std::move(prev), td::Ref<ValidatorSet>{},
+                                    Ed25519_PublicKey{Bits256::zero()}, td::Ref<CollatorOptions>{true},
+                                    std::move(manager), timeout, std::move(promise), td::CancellationToken{}, 0, 0)
       .release();
 }
 
 void run_liteserver_query(td::BufferSlice data, td::actor::ActorId<ValidatorManager> manager,
-                          td::Promise<td::BufferSlice> promise) {
-  LiteQuery::run_query(std::move(data), std::move(manager), std::move(promise));
+                          td::actor::ActorId<LiteServerCache> cache, td::Promise<td::BufferSlice> promise) {
+  LiteQuery::run_query(std::move(data), std::move(manager), std::move(cache), std::move(promise));
+}
+
+void run_fetch_account_state(WorkchainId wc, StdSmcAddress  addr, td::actor::ActorId<ValidatorManager> manager,
+                             td::Promise<std::tuple<td::Ref<vm::CellSlice>,UnixTime,LogicalTime,std::unique_ptr<block::ConfigInfo>>> promise) {
+  LiteQuery::fetch_account_state(wc, addr, std::move(manager), std::move(promise));
 }
 
 void run_validate_shard_block_description(td::BufferSlice data, BlockHandle masterchain_block,

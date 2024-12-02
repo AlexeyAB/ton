@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "accept-block.hpp"
 #include "adnl/utils.hpp"
@@ -41,17 +41,22 @@ using namespace std::literals::string_literals;
 
 AcceptBlockQuery::AcceptBlockQuery(BlockIdExt id, td::Ref<BlockData> data, std::vector<BlockIdExt> prev,
                                    td::Ref<ValidatorSet> validator_set, td::Ref<BlockSignatureSet> signatures,
-                                   bool send_broadcast, td::actor::ActorId<ValidatorManager> manager,
-                                   td::Promise<td::Unit> promise)
+                                   td::Ref<BlockSignatureSet> approve_signatures, int send_broadcast_mode,
+                                   td::actor::ActorId<ValidatorManager> manager, td::Promise<td::Unit> promise)
     : id_(id)
     , data_(std::move(data))
     , prev_(std::move(prev))
     , validator_set_(std::move(validator_set))
     , signatures_(std::move(signatures))
+    , approve_signatures_(std::move(approve_signatures))
     , is_fake_(false)
-    , send_broadcast_(send_broadcast)
+    , is_fork_(false)
+    , send_broadcast_mode_(send_broadcast_mode)
     , manager_(manager)
-    , promise_(std::move(promise)) {
+    , promise_(std::move(promise))
+    , perf_timer_("acceptblock", 0.1, [manager](double duration) {
+        send_closure(manager, &ValidatorManager::add_perf_timer_stat, "acceptblock", duration);
+      }) {
   state_keep_old_hash_.clear();
   state_old_hash_.clear();
   state_hash_.clear();
@@ -66,13 +71,86 @@ AcceptBlockQuery::AcceptBlockQuery(AcceptBlockQuery::IsFake fake, BlockIdExt id,
     , prev_(std::move(prev))
     , validator_set_(std::move(validator_set))
     , is_fake_(true)
-    , send_broadcast_(false)
+    , is_fork_(false)
     , manager_(manager)
-    , promise_(std::move(promise)) {
+    , promise_(std::move(promise))
+    , perf_timer_("acceptblock", 0.1, [manager](double duration) {
+        send_closure(manager, &ValidatorManager::add_perf_timer_stat, "acceptblock", duration);
+      }) {
   state_keep_old_hash_.clear();
   state_old_hash_.clear();
   state_hash_.clear();
   CHECK(prev_.size() > 0);
+}
+
+AcceptBlockQuery::AcceptBlockQuery(ForceFork ffork, BlockIdExt id, td::Ref<BlockData> data,
+                                   td::actor::ActorId<ValidatorManager> manager, td::Promise<td::Unit> promise)
+    : id_(id)
+    , data_(std::move(data))
+    , is_fake_(true)
+    , is_fork_(true)
+    , manager_(manager)
+    , promise_(std::move(promise))
+    , perf_timer_("acceptblock", 0.1, [manager](double duration) {
+        send_closure(manager, &ValidatorManager::add_perf_timer_stat, "acceptblock", duration);
+      }) {
+  state_keep_old_hash_.clear();
+  state_old_hash_.clear();
+  state_hash_.clear();
+}
+
+bool AcceptBlockQuery::precheck_header() {
+  VLOG(VALIDATOR_DEBUG) << "precheck_header()";
+  // 0. sanity check
+  CHECK(data_.not_null());
+  block_root_ = data_->root_cell();
+  if (data_->block_id() != id_) {
+    return fatal_error("incorrect block id in block data: "s + data_->block_id().to_str() + " instead of " +
+                       id_.to_str());
+  }
+  // 1. root hash and file hash check
+  RootHash blk_rhash{block_root_->get_hash().bits()};
+  if (blk_rhash != id_.root_hash) {
+    return fatal_error("block root hash mismatch: expected "s + id_.root_hash.to_hex() + ", found " +
+                       blk_rhash.to_hex());
+  }
+  if (is_fake_ || is_fork_) {
+    FileHash blk_fhash;
+    td::sha256(data_->data().as_slice(), blk_fhash.as_slice());
+    if (blk_fhash != id_.file_hash) {
+      return fatal_error("block file hash mismatch: expected "s + id_.file_hash.to_hex() + ", computed " +
+                         blk_fhash.to_hex());
+    }
+  }
+  // 2. check header fields
+  std::vector<ton::BlockIdExt> prev;
+  ton::BlockIdExt mc_blkid;
+  bool after_split;
+  auto res = block::unpack_block_prev_blk_try(block_root_, id_, prev, mc_blkid, after_split);
+  if (res.is_error()) {
+    return fatal_error("invalid block header in AcceptBlock: "s + res.to_string());
+  }
+  if (is_fork_) {
+    prev_ = prev;
+  } else if (prev_ != prev) {
+    return fatal_error("invalid previous block reference(s) in block header");
+  }
+  // 3. unpack header and check vert_seqno fields
+  block::gen::Block::Record blk;
+  block::gen::BlockInfo::Record info;
+  if (!(tlb::unpack_cell(block_root_, blk) && tlb::unpack_cell(blk.info, info))) {
+    return fatal_error("cannot unpack block header");
+  }
+  if (info.vert_seqno_incr && !is_fork_) {
+    return fatal_error("block header has vert_seqno_incr set in an ordinary AcceptBlock");
+  }
+  if (!info.vert_seqno_incr && is_fork_) {
+    return fatal_error("fork block header has no vert_seqno_incr");
+  }
+  if (is_fork_ && !info.key_block) {
+    return fatal_error("fork block is not a key block");
+  }
+  return true;
 }
 
 bool AcceptBlockQuery::create_new_proof() {
@@ -88,13 +166,14 @@ bool AcceptBlockQuery::create_new_proof() {
   auto usage_cell = vm::UsageCell::create(block_root_, usage_tree->root_ptr());
   block::gen::Block::Record blk;
   block::gen::BlockInfo::Record info;
+  block::gen::BlockExtra::Record extra;
   block::gen::ExtBlkRef::Record mcref{};  // _ ExtBlkRef = BlkMasterInfo;
   block::CurrencyCollection fees;
   ShardIdFull shard;
   if (!(tlb::unpack_cell(usage_cell, blk) && tlb::unpack_cell(blk.info, info) && !info.version &&
-        block::tlb::t_ShardIdent.unpack(info.shard.write(), shard) && !info.vert_seq_no &&
+        block::tlb::t_ShardIdent.unpack(info.shard.write(), shard) &&
         block::gen::BlkPrevInfo{info.after_merge}.validate_ref(info.prev_ref) &&
-        block::gen::t_ValueFlow.force_validate_ref(blk.value_flow) &&
+        tlb::unpack_cell(std::move(blk.extra), extra) && block::gen::t_ValueFlow.force_validate_ref(blk.value_flow) &&
         (!info.not_master || tlb::unpack_cell(info.master_ref, mcref)))) {
     return fatal_error("cannot unpack block header");
   }
@@ -126,10 +205,9 @@ bool AcceptBlockQuery::create_new_proof() {
   }
   // 4. visit validator-set related fields in key blocks
   if (is_key_block_) {
-    block::gen::BlockExtra::Record extra;
     block::gen::McBlockExtra::Record mc_extra;
-    if (!(tlb::unpack_cell(std::move(blk.extra), extra) && tlb::unpack_cell(extra.custom->prefetch_ref(), mc_extra) &&
-          mc_extra.key_block && mc_extra.config.not_null())) {
+    if (!(tlb::unpack_cell(extra.custom->prefetch_ref(), mc_extra) && mc_extra.key_block &&
+          mc_extra.config.not_null())) {
       return fatal_error("cannot unpack extra header of key masterchain block "s + blk_id.to_str());
     }
     auto cfg = block::Config::unpack_config(std::move(mc_extra.config));
@@ -145,6 +223,9 @@ bool AcceptBlockQuery::create_new_proof() {
   }
   // 5. finish constructing Merkle proof from visited cells
   auto proof = vm::MerkleProof::generate(block_root_, usage_tree.get());
+  if (proof.is_null()) {
+    return fatal_error("cannot create proof");
+  }
   proof_roots_.push_back(proof);
   // 6. extract some information from state update
   state_old_hash_ = upd_cs.prefetch_ref(0)->get_hash(0).bits();
@@ -156,10 +237,8 @@ bool AcceptBlockQuery::create_new_proof() {
     mc_blkid_.root_hash = mcref.root_hash;
     mc_blkid_.file_hash = mcref.file_hash;
   } else if (!is_key_block_) {
-    block::gen::BlockExtra::Record extra;
     block::gen::McBlockExtra::Record mc_extra;
-    if (!(tlb::unpack_cell(std::move(blk.extra), extra) && tlb::unpack_cell(extra.custom->prefetch_ref(), mc_extra) &&
-          !mc_extra.key_block)) {
+    if (!(tlb::unpack_cell(extra.custom->prefetch_ref(), mc_extra) && !mc_extra.key_block)) {
       return fatal_error("extra header of non-key masterchain block "s + blk_id.to_str() +
                          " is invalid or contains extra information reserved for key blocks only");
     }
@@ -193,9 +272,9 @@ bool AcceptBlockQuery::create_new_proof() {
   } else {  // FAKE
     vm::CellBuilder cb2;
     if (!(cb2.store_long_bool(0x11, 8)  // block_signatures#11
-          && cb2.store_long_bool(validator_set_->get_validator_set_hash(),
+          && cb2.store_long_bool(validator_set_.not_null() ? validator_set_->get_validator_set_hash() : 0,
                                  32)  // validator_info$_ validator_set_hash_short:uint32
-          && cb2.store_long_bool(validator_set_->get_catchain_seqno(),
+          && cb2.store_long_bool(validator_set_.not_null() ? validator_set_->get_catchain_seqno() : 0,
                                  32)     //   validator_set_ts:uint32 = ValidatorInfo
           && cb2.store_long_bool(0, 32)  // sig_count:uint32
           && cb2.store_long_bool(0, 64)  // sig_weight:uint32
@@ -286,12 +365,32 @@ void AcceptBlockQuery::start_up() {
   VLOG(VALIDATOR_DEBUG) << "start_up()";
   alarm_timestamp() = timeout_;
 
-  if (validator_set_.is_null()) {
+  if (!is_fork_ && validator_set_.is_null()) {
     fatal_error("no real ValidatorSet passed to AcceptBlockQuery");
     return;
   }
   if (!is_fake_ && signatures_.is_null()) {
     fatal_error("no real SignatureSet passed to AcceptBlockQuery");
+    return;
+  }
+  if (!is_fake_ && is_fork_) {
+    fatal_error("a non-fake AcceptBlockQuery for a forced fork block");
+    return;
+  }
+  if (!is_fork_ && !prev_.size()) {
+    fatal_error("no previous blocks passed to AcceptBlockQuery");
+    return;
+  }
+  if (is_fork_ && !is_masterchain()) {
+    fatal_error("cannot accept a non-masterchain fork block");
+    return;
+  }
+  if (is_fork_ && data_.is_null()) {
+    fatal_error("cannot accept a fork block without explicit data");
+    return;
+  }
+  if (data_.not_null() && !precheck_header()) {
+    fatal_error("invalid block header in AcceptBlock");
     return;
   }
 
@@ -312,7 +411,36 @@ void AcceptBlockQuery::got_block_handle(BlockHandle handle) {
                         : handle_->inited_proof_link())) {
     finish_query();
     return;
+                        }
+  if (data_.is_null()) {
+    td::actor::send_closure(manager_, &ValidatorManager::get_candidate_data_by_block_id_from_db, id_, [SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
+      if (R.is_ok()) {
+        td::actor::send_closure(SelfId, &AcceptBlockQuery::got_block_candidate_data, R.move_as_ok());
+      } else {
+        td::actor::send_closure(SelfId, &AcceptBlockQuery::got_block_handle_cont);
+      }
+    });
+  } else {
+    got_block_handle_cont();
   }
+}
+
+void AcceptBlockQuery::got_block_candidate_data(td::BufferSlice data) {
+  auto r_block = create_block(id_, std::move(data));
+  if (r_block.is_error()) {
+    fatal_error("invalid block candidate data in db: " + r_block.error().to_string());
+    return;
+  }
+  data_ = r_block.move_as_ok();
+  VLOG(VALIDATOR_DEBUG) << "got block candidate data from db";
+  if (data_.not_null() && !precheck_header()) {
+    fatal_error("invalid block header in AcceptBlock");
+    return;
+  }
+  got_block_handle_cont();
+}
+
+void AcceptBlockQuery::got_block_handle_cont() {
   if (data_.not_null() && !handle_->received()) {
     td::actor::send_closure(
         manager_, &ValidatorManager::set_block_data, handle_, data_, [SelfId = actor_id(this)](td::Result<td::Unit> R) {
@@ -382,6 +510,10 @@ void AcceptBlockQuery::got_block_data(td::Ref<BlockData> data) {
   CHECK(data_.not_null());
   if (data_->root_cell().is_null()) {
     fatal_error("block data does not contain a root cell");
+    return;
+  }
+  if (!precheck_header()) {
+    fatal_error("invalid block header in AcceptBlock");
     return;
   }
   if (handle_->received()) {
@@ -647,9 +779,15 @@ bool AcceptBlockQuery::unpack_proof_link(BlockIdExt id, Ref<ProofLink> proof_lin
   }
   try {
     block::gen::Block::Record block;
+    block::gen::BlockExtra::Record extra;
     if (!(tlb::unpack_cell(virt_root, block) && block::gen::t_ValueFlow.force_validate_ref(block.value_flow))) {
       return fatal_error("block proof link for block "s + id.to_str() + " does not contain value flow information");
     }
+    /* TEMP (uncomment later)
+    if (!tlb::unpack_cell(std::move(block.extra), extra)) {
+      return fatal_error("block proof link for block "s + id.to_str() + " does not contain BlockExtra information");
+    }
+    */
   } catch (vm::VmError& err) {
     return fatal_error("error unpacking proof link for block "s + id.to_str() + " : " + err.get_msg());
   } catch (vm::VmVirtError& err) {
@@ -671,7 +809,8 @@ void AcceptBlockQuery::got_proof_link(BlockIdExt id, Ref<ProofLink> proof) {
     // first link in chain
     if (ancestors_.size() != link_prev_.size() || ancestors_[0]->blk_ != link_prev_[0] ||
         (ancestors_.size() == 2 && ancestors_[1]->blk_ != link_prev_[1])) {
-      fatal_error("invalid first link at block "s + id.to_str() + " for shardchain block " + id_.to_str());
+      fatal_error("invalid first link at block "s + id.to_str() + " for shardchain block " + id_.to_str(),
+                  ErrorCode::cancelled);
       return;
     }
     create_topshard_blk_descr();
@@ -680,7 +819,8 @@ void AcceptBlockQuery::got_proof_link(BlockIdExt id, Ref<ProofLink> proof) {
     // intermediate link
     if (link_prev_.size() != 1 || ton::ShardIdFull(link_prev_[0].id) != ton::ShardIdFull(id_) ||
         link_prev_[0].id.seqno + 1 != id.id.seqno) {
-      fatal_error("invalid intermediate link at block "s + id.to_str() + " for shardchain block " + id_.to_str());
+      fatal_error("invalid intermediate link at block "s + id.to_str() + " for shardchain block " + id_.to_str(),
+                  ErrorCode::cancelled);
       return;
     }
     require_proof_link(link_prev_[0]);
@@ -779,18 +919,17 @@ void AcceptBlockQuery::written_block_info_2() {
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Unit> R) {
       check_send_error(SelfId, R) || td::actor::send_closure_bool(SelfId, &AcceptBlockQuery::applied);
     });
-    run_apply_block_query(handle_->id(), data_, manager_, timeout_, std::move(P));
+    run_apply_block_query(handle_->id(), data_, handle_->id(), manager_, timeout_, std::move(P));
   } else {
     applied();
   }
 }
 
 void AcceptBlockQuery::applied() {
-  if (!send_broadcast_) {
+  if (send_broadcast_mode_ == 0) {
     finish_query();
     return;
   }
-
   BlockBroadcast b;
   b.data = data_->data();
   b.block_id = id_;
@@ -810,7 +949,7 @@ void AcceptBlockQuery::applied() {
   }
 
   // do not wait for answer
-  td::actor::send_closure_later(manager_, &ValidatorManager::send_block_broadcast, std::move(b));
+  td::actor::send_closure_later(manager_, &ValidatorManager::send_block_broadcast, std::move(b), send_broadcast_mode_);
 
   finish_query();
 }

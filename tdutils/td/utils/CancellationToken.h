@@ -14,12 +14,13 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
 #include <atomic>
 #include <memory>
+#include "Status.h"
 
 namespace td {
 
@@ -32,8 +33,19 @@ struct RawCancellationToken {
 class CancellationToken {
  public:
   explicit operator bool() const {
+    // Empty CancellationToken is never cancelled
+    if (!token_) {
+      return false;
+    }
     return token_->is_cancelled_.load(std::memory_order_acquire);
   }
+  Status check() const {
+    if (*this) {
+      return Status::Error(653, "cancelled");  // cancelled = 653
+    }
+    return Status::OK();
+  }
+  CancellationToken() = default;
   explicit CancellationToken(std::shared_ptr<detail::RawCancellationToken> token) : token_(std::move(token)) {
   }
 

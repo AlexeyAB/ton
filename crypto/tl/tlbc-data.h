@@ -14,11 +14,12 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include <string>
 #include <vector>
+#include "common/linalloc.hpp"
 
 namespace tlbc {
 
@@ -26,11 +27,25 @@ using src::Lexem;
 using src::Lexer;
 using sym::sym_idx_t;
 
+extern td::LinearAllocator AR;
+
 struct Type;
 struct Constructor;
 
 struct TypeExpr {
-  enum { te_Unknown, te_Type, te_Param, te_Apply, te_Add, te_MulConst, te_IntConst, te_Tuple, te_Ref, te_CondType };
+  enum {
+    te_Unknown,
+    te_Type,
+    te_Param,
+    te_Apply,
+    te_Add,
+    te_GetBit,
+    te_MulConst,
+    te_IntConst,
+    te_Tuple,
+    te_Ref,
+    te_CondType
+  };
   enum { max_const_expr = 100000, const_htable_size = 170239 };
   int tp;
   int value;

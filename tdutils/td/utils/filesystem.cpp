@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "td/utils/filesystem.h"
 
@@ -53,21 +53,29 @@ SecureString create_empty<SecureString>(size_t size) {
 template <class T>
 Result<T> read_file_impl(CSlice path, int64 size, int64 offset) {
   TRY_RESULT(from_file, FileFd::open(path, FileFd::Read));
+  TRY_RESULT(file_size, from_file.get_size());
+  if (offset < 0 || offset > file_size) {
+    return Status::Error("Failed to read file: invalid offset");
+  }
   if (size == -1) {
-    TRY_RESULT(file_size, from_file.get_size());
-    size = file_size;
+    size = file_size - offset;
+  } else if (size >= 0) {
+    if (size > file_size - offset) {
+      size = file_size - offset;
+    }
   }
   if (size < 0) {
     return Status::Error("Failed to read file: invalid size");
   }
-  if (offset < 0 || offset > size) {
-    return Status::Error("Failed to read file: invalid offset");
-  }
-  size -= offset;
   auto content = create_empty<T>(narrow_cast<size_t>(size));
-  TRY_RESULT(got_size, from_file.pread(as_mutable_slice(content), offset));
-  if (got_size != static_cast<size_t>(size)) {
-    return Status::Error("Failed to read file");
+  MutableSlice slice = as_mutable_slice(content);
+  while (!slice.empty()) {
+    TRY_RESULT(got_size, from_file.pread(slice, offset));
+    if (got_size == 0) {
+      return Status::Error("Failed to read file");
+    }
+    offset += got_size;
+    slice.remove_prefix(got_size);
   }
   from_file.close();
   return std::move(content);
@@ -100,9 +108,15 @@ Status write_file(CSlice to, Slice data, WriteFileOptions options) {
     TRY_STATUS(to_file.lock(FileFd::LockFlags::Write, to.str(), 10));
     TRY_STATUS(to_file.truncate_to_current_position(0));
   }
-  TRY_RESULT(written, to_file.write(data));
-  if (written != size) {
-    return Status::Error(PSLICE() << "Failed to write file: written " << written << " bytes instead of " << size);
+  size_t total_written = 0;
+  while (!data.empty()) {
+    TRY_RESULT(written, to_file.write(data));
+    if (written == 0) {
+      return Status::Error(PSLICE() << "Failed to write file: written " << total_written << " bytes instead of "
+                                    << size);
+    }
+    total_written += written;
+    data.remove_prefix(written);
   }
   if (options.need_sync) {
     TRY_STATUS(to_file.sync());

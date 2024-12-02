@@ -14,11 +14,12 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "common/refcnt.hpp"
 #include "common/bitstring.h"
+#include "td/utils/HashSet.h"
 
 #include "vm/cells/CellHash.h"
 #include "vm/cells/CellTraits.h"
@@ -86,4 +87,31 @@ class Cell : public CellTraits {
 };
 
 std::ostream& operator<<(std::ostream& os, const Cell& c);
+
+using is_transparent = void;  // Pred to use
+inline vm::CellHash as_cell_hash(const Ref<Cell>& cell) {
+  return cell->get_hash();
+}
+inline vm::CellHash as_cell_hash(td::Slice hash) {
+  return vm::CellHash::from_slice(hash);
+}
+inline vm::CellHash as_cell_hash(vm::CellHash hash) {
+  return hash;
+}
+struct CellEqF {
+  using is_transparent = void;  // Pred to use
+  template <class A, class B>
+  bool operator()(const A& a, const B& b) const {
+    return as_cell_hash(a) == as_cell_hash(b);
+  }
+};
+struct CellHashF {
+  using is_transparent = void;  // Pred to use
+  using transparent_key_equal = CellEqF;
+  template <class T>
+  size_t operator()(const T& value) const {
+    return cell_hash_slice_hash(as_cell_hash(value).as_slice());
+  }
+};
+using CellHashSet = td::HashSet<td::Ref<Cell>, CellHashF, CellEqF>;
 }  // namespace vm

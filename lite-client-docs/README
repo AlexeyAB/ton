@@ -8,36 +8,38 @@ The software is likely to compile and work properly on most Linux systems. It sh
 
 BASIC COMPILATION AND INSTALLATION INSTRUCTIONS
 
-1) Download and unpack the newest version of this archive, available at
+1) Download the newest version of the TON blockchain sources, available at GitHub repository https://github.com/ton-blockchain/ton/ :
 
-https://test.ton.org/download
+git clone https://github.com/ton-blockchain/ton.git
+git submodule update
 
 The TON Blockchain Test Network is updated quite often, so we cannot guarantee that older versions of the Lite Client will always work. Backward compatibility is not enforced at this development stage.
 
-2) Install the newest versions of make, cmake (version 3.0.2 or later), OpenSSL (including C header files), and g++ or clang (or another C++14-compatible compiler as appropriate for your operating system).
+2) Install the newest versions of make, cmake (version 3.0.2 or later), OpenSSL (including C header files), and g++ or clang (or another C++14-compatible compiler as appropriate for your operating system). We strongly recommend installing OpenSSL version 1.1.1 or later for better performance, especially if you intend to run a Full Node or a Validator as well.
 
-3) Suppose that you have unpacked this archive to directory ~/lite-client, where ~ is your home directory, and that you have created an empty directory ~/liteclient-build. Then run the following in a terminal on a Linux system:
+3) Suppose that you have fetched the source tree to directory ~/ton, where ~ is your home directory, and that you have created an empty directory ~/liteclient-build. Then run the following in a terminal on a Linux system:
 
 cd ~/liteclient-build
-cmake ~/lite-client
+cmake ~/ton
 cmake --build . --target lite-client
 
-You might also want to build some extra utilities useful for smart-contract development:
+You might also build some extra utilities useful for smart-contract development:
 
 cmake --build . --target fift
+cmake --build . --target func
 
-4) Download the newest configuration file from https://test.ton.org/ton-lite-client-test1.config.json :
+4) Download the newest configuration file from https://ton.org/global-config.json :
 
-wget https://test.ton.org/ton-lite-client-test1.config.json
+wget https://ton.org/global-config.json
 
 5) Run the Lite Client:
 
-./lite-client/lite-client -C ton-lite-client-test1.config.json
+./lite-client/lite-client -C global-config.json
 
 If everything was installed successfully, the Lite Client will connect to a special server (a full node for the TON Blockchain Test Network #1) and will send some queries to the server.
 If you indicate a writeable "database" directory as an extra argument to the client, it will download and save the block and the state corresponding to the newest masterchain block:
 
-./lite-client/lite-client -C ton-lite-client-test1.config.json -D ~/ton-db-dir
+./lite-client/lite-client -C global-config.json -D ~/ton-db-dir
 
 Basic help info can be obtained by typing "help" into the Lite Client. Type "quit" or press Ctrl-C to exit.
 
@@ -45,4 +47,4 @@ Basic help info can be obtained by typing "help" into the Lite Client. Type "qui
 
 More details on these activities, including step-by-step instructions for creating a simple wallet smart contract (along with its source code), may be found in the HOWTO file included in this archive.
 
-7) Some documentation on the TON Blockchain and TON Virtual Machine may be found at the download page https://test.ton.org/download . Be aware that this documentation may not be completely in sync with the version currently employed by the Test Network, because some minor implementation details are likely to be changed during the final development and testing phases.
+7) Some documentation on the TON Blockchain and TON Virtual Machine may be found at the download page https://ton.org/docs/ . Be aware that this documentation may not be completely in sync with the version currently employed by the Test Network, because some minor implementation details are likely to be changed during the final development and testing phases.
