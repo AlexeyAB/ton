@@ -14,57 +14,86 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "Config.h"
 #include "adnl/adnl-node-id.hpp"
 #include "td/utils/JsonBuilder.h"
+#include "auto/tl/ton_api_json.h"
+#include "ton/ton-tl.hpp"
 
 namespace tonlib {
+td::Result<ton::BlockIdExt> parse_block_id_ext(td::JsonObject &obj) {
+  ton::WorkchainId zero_workchain_id;
+  {
+    TRY_RESULT(wc, td::get_json_object_int_field(obj, "workchain"));
+    zero_workchain_id = wc;
+  }
+  ton::ShardId zero_shard_id;  // uint64
+  {
+    TRY_RESULT(shard_id, td::get_json_object_long_field(obj, "shard"));
+    zero_shard_id = static_cast<ton::ShardId>(shard_id);
+  }
+  ton::BlockSeqno zero_seqno;
+  {
+    TRY_RESULT(seqno, td::get_json_object_int_field(obj, "seqno"));
+    zero_seqno = seqno;
+  }
+
+  ton::RootHash zero_root_hash;
+  {
+    TRY_RESULT(hash_b64, td::get_json_object_string_field(obj, "root_hash"));
+    TRY_RESULT(hash, td::base64_decode(hash_b64));
+    if (hash.size() * 8 != ton::RootHash::size()) {
+      return td::Status::Error("Invalid config (8)");
+    }
+    zero_root_hash = ton::RootHash(td::ConstBitPtr(td::Slice(hash).ubegin()));
+  }
+  ton::FileHash zero_file_hash;
+  {
+    TRY_RESULT(hash_b64, td::get_json_object_string_field(obj, "file_hash"));
+    TRY_RESULT(hash, td::base64_decode(hash_b64));
+    if (hash.size() * 8 != ton::FileHash::size()) {
+      return td::Status::Error("Invalid config (9)");
+    }
+    zero_file_hash = ton::RootHash(td::ConstBitPtr(td::Slice(hash).ubegin()));
+  }
+
+  return ton::BlockIdExt(zero_workchain_id, zero_shard_id, zero_seqno, std::move(zero_root_hash),
+                         std::move(zero_file_hash));
+}
 td::Result<Config> Config::parse(std::string str) {
   TRY_RESULT(json, td::json_decode(str));
   if (json.type() != td::JsonValue::Type::Object) {
-    return td::Status::Error("Invalid config (1)");
+    return td::Status::Error("Invalid config: json is not an object");
   }
-  //TRY_RESULT(main_type, td::get_json_object_string_field(json.get_object(), "@type", false));
-  //if (main_type != "config.global") {
-  //return td::Status::Error("Invalid config (3)");
-  //}
-  TRY_RESULT(lite_clients_obj,
-             td::get_json_object_field(json.get_object(), "liteservers", td::JsonValue::Type::Array, false));
-  auto &lite_clients = lite_clients_obj.get_array();
-
   Config res;
-  for (auto &value : lite_clients) {
-    if (value.type() != td::JsonValue::Type::Object) {
-      return td::Status::Error("Invalid config (2)");
-    }
-    auto &object = value.get_object();
-    //TRY_RESULT(value_type, td::get_json_object_string_field(object, "@type", false));
-    //if (value_type != "liteclient.config.global") {
-    //return td::Status::Error("Invalid config (4)");
-    //}
+  ton::ton_api::liteclient_config_global conf;
+  TRY_STATUS(ton::ton_api::from_json(conf, json.get_object()));
+  TRY_RESULT_ASSIGN(res.lite_servers, liteclient::LiteServerConfig::parse_global_config(conf));
 
-    TRY_RESULT(ip, td::get_json_object_int_field(object, "ip", false));
-    TRY_RESULT(port, td::get_json_object_int_field(object, "port", false));
-    Config::LiteClient client;
-    TRY_STATUS(client.address.init_host_port(td::IPAddress::ipv4_to_str(ip), port));
-
-    TRY_RESULT(id_obj, td::get_json_object_field(object, "id", td::JsonValue::Type::Object, false));
-    auto &id = id_obj.get_object();
-    TRY_RESULT(id_type, td::get_json_object_string_field(id, "@type", false));
-    if (id_type != "pub.ed25519") {
-      return td::Status::Error("Invalid config (5)");
-    }
-    TRY_RESULT(key_base64, td::get_json_object_string_field(id, "key", false));
-    TRY_RESULT(key, td::base64_decode(key_base64));
-    if (key.size() != 32) {
-      return td::Status::Error("Invalid config (6)");
-    }
-
-    client.adnl_id = ton::adnl::AdnlNodeIdFull(ton::pubkeys::Ed25519(td::Bits256(td::Slice(key).ubegin())));
-    res.lite_clients.push_back(std::move(client));
+  if (!conf.validator_) {
+    return td::Status::Error("Invalid config: no 'validator' section");
   }
+  if (!conf.validator_->zero_state_) {
+    return td::Status::Error("Invalid config: no zerostate");
+  }
+  res.zero_state_id = ton::create_block_id(conf.validator_->zero_state_);
+  if (conf.validator_->init_block_) {
+    res.init_block_id = ton::create_block_id(conf.validator_->init_block_);
+  }
+
+  for (auto &fork : conf.validator_->hardforks_) {
+    res.hardforks.push_back(ton::create_block_id(fork));
+  }
+
+  for (auto hardfork : res.hardforks) {
+    if (!res.init_block_id.is_valid() || hardfork.seqno() > res.init_block_id.seqno()) {
+      LOG(INFO) << "Replace init_block with hardfork: " << res.init_block_id.to_str() << " -> " << hardfork.to_str();
+      res.init_block_id = hardfork;
+    }
+  }
+
   return res;
 }
 }  // namespace tonlib

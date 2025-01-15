@@ -14,11 +14,12 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
 #include "td/actor/core/ActorState.h"
+#include "td/actor/core/ActorTypeStat.h"
 #include "td/actor/core/ActorMailbox.h"
 
 #include "td/utils/Heap.h"
@@ -34,13 +35,14 @@ class ActorInfo;
 using ActorInfoPtr = SharedObjectPool<ActorInfo>::Ptr;
 class ActorInfo : private HeapNode, private ListNode {
  public:
-  ActorInfo(std::unique_ptr<Actor> actor, ActorState::Flags state_flags, Slice name)
-      : actor_(std::move(actor)), name_(name.begin(), name.size()) {
+  ActorInfo(std::unique_ptr<Actor> actor, ActorState::Flags state_flags, Slice name, td::uint32 actor_stat_id)
+      : actor_(std::move(actor)), name_(name.begin(), name.size()), actor_stat_id_(actor_stat_id) {
     state_.set_flags_unsafe(state_flags);
     VLOG(actor) << "Create actor [" << name_ << "]";
   }
   ~ActorInfo() {
     VLOG(actor) << "Destroy actor [" << name_ << "]";
+    CHECK(!actor_);
   }
 
   bool is_alive() const {
@@ -56,6 +58,18 @@ class ActorInfo : private HeapNode, private ListNode {
   }
   Actor *actor_ptr() const {
     return actor_.get();
+  }
+  // NB: must be called only when actor is locked
+  ActorTypeStatRef actor_type_stat() {
+    auto res = ActorTypeStatManager::get_actor_type_stat(actor_stat_id_, actor_.get());
+    if (in_queue_since_) {
+      res.pop_from_queue(in_queue_since_);
+      in_queue_since_ = 0;
+    }
+    return res;
+  }
+  void on_add_to_queue() {
+    in_queue_since_ = td::Clocks::rdtsc();
   }
   void destroy_actor() {
     actor_.reset();
@@ -102,6 +116,8 @@ class ActorInfo : private HeapNode, private ListNode {
   std::atomic<double> alarm_timestamp_at_{0};
 
   ActorInfoPtr pin_;
+  td::uint64 in_queue_since_{0};
+  td::uint32 actor_stat_id_{0};
 };
 
 }  // namespace core

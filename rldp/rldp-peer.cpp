@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "rldp-peer.hpp"
 #include "adnl/utils.hpp"
@@ -38,9 +38,9 @@ void RldpTransferSenderImpl::create_encoder() {
     return;
   }
   td::BufferSlice D = data_.clone();
-  D.confirm_read(part_ * slice_size());
+  D.confirm_read(td::narrow_cast<std::size_t>(part_ * slice_size()));
   if (D.size() > slice_size()) {
-    D.truncate(slice_size());
+    D.truncate(td::narrow_cast<std::size_t>(slice_size()));
   }
   fec_type_ = td::fec::RaptorQEncoder::Parameters{D.size(), symbol_size(), 0};
   auto E = fec_type_.create_encoder(std::move(D));
@@ -125,6 +125,10 @@ void RldpTransferReceiverImpl::receive_part(fec::FecType fec_type, td::uint32 pa
   }
 
   if (!decoder_) {
+    if (offset_ + fec_type.size() > total_size_) {
+      VLOG(RLDP_NOTICE) << "failed to create decoder: data size in fec type is too big";
+      return;
+    }
     auto D = fec_type.create_decoder();
     if (D.is_error()) {
       VLOG(RLDP_WARNING) << "failed to create decoder: " << D.move_as_error();
@@ -143,7 +147,7 @@ void RldpTransferReceiverImpl::receive_part(fec::FecType fec_type, td::uint32 pa
                                           << " data_size=" << data.data.size() << " part=" << part_));
         return;
       }
-      data_.as_slice().remove_prefix(offset_).copy_from(data.data.as_slice());
+      data_.as_slice().remove_prefix(td::narrow_cast<std::size_t>(offset_)).copy_from(data.data.as_slice());
       offset_ += data.data.size();
       auto obj = create_tl_object<ton_api::rldp_complete>(transfer_id_, part_);
       td::actor::send_closure(adnl_, &adnl::Adnl::send_message, local_id_, peer_id_, serialize_tl_object(obj, true));

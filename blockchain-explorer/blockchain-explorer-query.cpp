@@ -24,10 +24,12 @@
     from all source files in the program, then also delete it here.
     along with TON Blockchain.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "blockchain-explorer-query.hpp"
 #include "blockchain-explorer-http.hpp"
+#include "block/mc-config.h"
+#include "crypto/block/check-proof.h"
 
 #include "auto/tl/lite_api.h"
 
@@ -39,6 +41,14 @@
 
 #include "common/errorcode.h"
 #include "block/block-auto.h"
+#include "crypto/vm/utils.h"
+#include "td/utils/crypto.h"
+
+#include "vm/boc.h"
+#include "vm/cellops.h"
+#include "vm/cells/MerkleProof.h"
+#include "vm/vm.h"
+#include "vm/cp0.h"
 
 td::Result<ton::BlockIdExt> parse_block_id(std::map<std::string, std::string> &opts, bool allow_empty) {
   if (allow_empty) {
@@ -131,14 +141,17 @@ td::Result<block::StdAddress> parse_account_addr(std::map<std::string, std::stri
     return td::Status::Error(ton::ErrorCode::error, "no account id");
   }
   std::string acc_string = it->second;
-  block::StdAddress a{acc_string};
-  if (a.is_valid()) {
+  block::StdAddress a;
+  if (a.parse_addr(td::Slice(acc_string))) {
     return a;
   }
   ton::WorkchainId workchain_id;
   it = opts.find("accountworkchain");
   if (it == opts.end()) {
-    return td::Status::Error(ton::ErrorCode::error, "no account workchain id");
+    it = opts.find("workchain");
+    if (it == opts.end()) {
+      return td::Status::Error(ton::ErrorCode::error, "no account workchain id");
+    }
   }
   try {
     workchain_id = std::stoi(it->second);
@@ -159,8 +172,9 @@ void HttpQueryCommon::abort_query(td::Status error) {
     HttpAnswer A{"error", prefix_};
     A.abort(std::move(error));
     auto page = A.finish();
-    promise_.set_value(
-        MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY));
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
   }
   stop();
 }
@@ -252,8 +266,9 @@ void HttpQueryBlockView::finish_query() {
       A << HttpAnswer::RawData<block::gen::Block>{root};
       return A.finish();
     }();
-    promise_.set_value(
-        MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY));
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
   }
   stop();
 }
@@ -392,8 +407,26 @@ void HttpQueryBlockInfo::got_transactions(td::BufferSlice data) {
                                static_cast<ton::LogicalTime>(T->lt_), T->hash_);
   }
 
-  if (!--pending_queries_) {
-    finish_query();
+  if (f->incomplete_ && transactions_.size() > 0) {
+    const auto &T = *transactions_.rbegin();
+    auto query_3 = ton::serialize_tl_object(
+        ton::create_tl_object<ton::lite_api::liteServer_listBlockTransactions>(
+            ton::create_tl_lite_block_id(block_id_), 7 + 128, 1024,
+            ton::create_tl_object<ton::lite_api::liteServer_transactionId3>(T.addr.addr, T.lt), false, false),
+        true);
+    auto P_3 = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
+      if (R.is_error()) {
+        td::actor::send_closure(SelfId, &HttpQueryBlockInfo::abort_query, R.move_as_error_prefix("litequery failed: "));
+      } else {
+        td::actor::send_closure(SelfId, &HttpQueryBlockInfo::got_transactions, R.move_as_ok());
+      }
+    });
+    td::actor::send_closure(CoreActorInterface::instance_actor_id(), &CoreActorInterface::send_lite_query,
+                            std::move(query_3), std::move(P_3));
+  } else {
+    if (!--pending_queries_) {
+      finish_query();
+    }
   }
 }
 
@@ -431,8 +464,9 @@ void HttpQueryBlockInfo::finish_query() {
 
       return A.finish();
     }();
-    promise_.set_value(
-        MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY));
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
   }
   stop();
 }
@@ -594,8 +628,27 @@ void HttpQueryBlockSearch::got_transactions(td::BufferSlice data) {
                                static_cast<ton::LogicalTime>(T->lt_), T->hash_);
   }
 
-  if (!--pending_queries_) {
-    finish_query();
+  if (f->incomplete_ && transactions_.size() > 0) {
+    const auto &T = *transactions_.rbegin();
+    auto query_3 = ton::serialize_tl_object(
+        ton::create_tl_object<ton::lite_api::liteServer_listBlockTransactions>(
+            ton::create_tl_lite_block_id(block_id_), 7 + 128, 1024,
+            ton::create_tl_object<ton::lite_api::liteServer_transactionId3>(T.addr.addr, T.lt), false, false),
+        true);
+    auto P_3 = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
+      if (R.is_error()) {
+        td::actor::send_closure(SelfId, &HttpQueryBlockSearch::abort_query,
+                                R.move_as_error_prefix("litequery failed: "));
+      } else {
+        td::actor::send_closure(SelfId, &HttpQueryBlockSearch::got_transactions, R.move_as_ok());
+      }
+    });
+    td::actor::send_closure(CoreActorInterface::instance_actor_id(), &CoreActorInterface::send_lite_query,
+                            std::move(query_3), std::move(P_3));
+  } else {
+    if (!--pending_queries_) {
+      finish_query();
+    }
   }
 }
 
@@ -633,8 +686,9 @@ void HttpQueryBlockSearch::finish_query() {
 
       return A.finish();
     }();
-    promise_.set_value(
-        MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY));
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
   }
   stop();
 }
@@ -719,8 +773,9 @@ void HttpQueryViewAccount::finish_query() {
       A << HttpAnswer::AccountCell{addr_, res_block_id_, root, Q_roots};
       return A.finish();
     }();
-    promise_.set_value(
-        MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY));
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
   }
   stop();
 }
@@ -817,8 +872,9 @@ void HttpQueryViewTransaction::finish_query() {
       }
       return A.finish();
     }();
-    promise_.set_value(
-        MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY));
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
   }
   stop();
 }
@@ -898,8 +954,9 @@ void HttpQueryViewTransaction2::finish_query() {
       A << HttpAnswer::TransactionCell{addr_, block_id_, list};
       return A.finish();
     }();
-    promise_.set_value(
-        MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY));
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
   }
   stop();
 }
@@ -950,6 +1007,383 @@ void HttpQueryViewLastBlock::finish_query() {
   stop();
 }
 
+HttpQueryConfig::HttpQueryConfig(std::string prefix, ton::BlockIdExt block_id, std::vector<td::int32> params,
+                                 td::Promise<MHD_Response *> promise)
+    : HttpQueryCommon(prefix, std::move(promise)), block_id_(block_id), params_(std::move(params)) {
+}
+
+HttpQueryConfig::HttpQueryConfig(std::map<std::string, std::string> opts, std::string prefix,
+                                 td::Promise<MHD_Response *> promise)
+    : HttpQueryCommon(prefix, std::move(promise)) {
+  auto R = parse_block_id(opts, true);
+  if (R.is_error()) {
+    error_ = R.move_as_error();
+    return;
+  }
+  block_id_ = R.move_as_ok();
+
+  auto it = opts.find("param");
+  if (it != opts.end()) {
+    auto R2 = td::to_integer_safe<int>(it->second);
+    if (R2.is_error()) {
+      error_ = R2.move_as_error();
+      return;
+    }
+    params_.push_back(R2.move_as_ok());
+  }
+}
+
+void HttpQueryConfig::start_up() {
+  if (error_.is_error()) {
+    abort_query(std::move(error_));
+    return;
+  }
+  if (block_id_.is_valid()) {
+    send_main_query();
+  } else {
+    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
+      if (R.is_error()) {
+        td::actor::send_closure(SelfId, &HttpQueryConfig::abort_query, R.move_as_error());
+      } else {
+        td::actor::send_closure(SelfId, &HttpQueryConfig::got_block, R.move_as_ok());
+      }
+    });
+
+    auto query = ton::serialize_tl_object(ton::create_tl_object<ton::lite_api::liteServer_getMasterchainInfo>(), true);
+    td::actor::send_closure(CoreActorInterface::instance_actor_id(), &CoreActorInterface::send_lite_query,
+                            std::move(query), std::move(P));
+  }
+}
+
+void HttpQueryConfig::got_block(td::BufferSlice data) {
+  auto F = ton::fetch_tl_object<ton::lite_api::liteServer_masterchainInfo>(std::move(data), true);
+  if (F.is_error()) {
+    abort_query(F.move_as_error());
+    return;
+  }
+  auto f = F.move_as_ok();
+  block_id_ = ton::create_block_id(f->last_);
+
+  send_main_query();
+}
+
+void HttpQueryConfig::send_main_query() {
+  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
+    if (R.is_error()) {
+      td::actor::send_closure(SelfId, &HttpQueryConfig::abort_query, R.move_as_error());
+    } else {
+      td::actor::send_closure(SelfId, &HttpQueryConfig::got_result, R.move_as_ok());
+    }
+  });
+  auto query =
+      params_.size() > 0
+          ? ton::serialize_tl_object(ton::create_tl_object<ton::lite_api::liteServer_getConfigParams>(
+                                         0, ton::create_tl_lite_block_id(block_id_), std::vector<int>(params_)),
+                                     true)
+          : ton::serialize_tl_object(ton::create_tl_object<ton::lite_api::liteServer_getConfigAll>(
+                                         0, ton::create_tl_lite_block_id(block_id_)),
+                                     true);
+  td::actor::send_closure(CoreActorInterface::instance_actor_id(), &CoreActorInterface::send_lite_query,
+                          std::move(query), std::move(P));
+}
+
+void HttpQueryConfig::got_result(td::BufferSlice data) {
+  auto F = ton::fetch_tl_object<ton::lite_api::liteServer_configInfo>(std::move(data), true);
+  if (F.is_error()) {
+    abort_query(F.move_as_error());
+    return;
+  }
+  auto f = F.move_as_ok();
+
+  state_proof_ = std::move(f->state_proof_);
+  config_proof_ = std::move(f->config_proof_);
+
+  finish_query();
+}
+
+void HttpQueryConfig::finish_query() {
+  if (promise_) {
+    auto page = [&]() -> std::string {
+      HttpAnswer A{"config", prefix_};
+      A.set_block_id(block_id_);
+      auto R = block::check_extract_state_proof(block_id_, state_proof_.as_slice(), config_proof_.as_slice());
+      if (R.is_error()) {
+        A.abort(PSTRING() << "masterchain state proof for " << block_id_.to_str()
+                          << " is invalid : " << R.move_as_error());
+        return A.finish();
+      }
+      try {
+        auto res = block::Config::extract_from_state(R.move_as_ok(), 0);
+        if (res.is_error()) {
+          A.abort(PSTRING() << "cannot unpack configuration: " << res.move_as_error());
+          return A.finish();
+        }
+        auto config = res.move_as_ok();
+        if (params_.size() > 0) {
+          A << "<p>params: ";
+          for (int i : params_) {
+            auto value = config->get_config_param(i);
+            if (value.not_null()) {
+              A << "<a href=\"#configparam" << i << "\">" << i << "</a> ";
+            }
+          }
+          A << "</p>";
+          for (int i : params_) {
+            auto value = config->get_config_param(i);
+            if (value.not_null()) {
+              A << HttpAnswer::ConfigParam{i, value};
+            } else {
+              A << HttpAnswer::Error{td::Status::Error(404, PSTRING() << "empty param " << i)};
+            }
+          }
+        } else {
+          A << "<p>params: ";
+          config->foreach_config_param([&](int i, td::Ref<vm::Cell> value) {
+            if (value.not_null()) {
+              A << "<a href=\"#configparam" << i << "\">" << i << "</a> ";
+            }
+            return true;
+          });
+          A << "</p>";
+          config->foreach_config_param([&](int i, td::Ref<vm::Cell> value) {
+            if (value.not_null()) {
+              A << HttpAnswer::ConfigParam{i, value};
+            }
+            return true;
+          });
+        }
+      } catch (vm::VmError &err) {
+        A.abort(PSTRING() << "error while traversing configuration: " << err.get_msg());
+      } catch (vm::VmVirtError &err) {
+        A.abort(PSTRING() << "virtualization error while traversing configuration: " << err.get_msg());
+      }
+      return A.finish();
+    }();
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
+  }
+  stop();
+}
+
+HttpQuerySendForm::HttpQuerySendForm(std::string prefix, td::Promise<MHD_Response *> promise)
+    : HttpQueryCommon(prefix, std::move(promise)) {
+}
+
+HttpQuerySendForm::HttpQuerySendForm(std::map<std::string, std::string> opts, std::string prefix,
+                                     td::Promise<MHD_Response *> promise)
+    : HttpQueryCommon(prefix, std::move(promise)) {
+}
+
+void HttpQuerySendForm::start_up() {
+  finish_query();
+}
+
+void HttpQuerySendForm::finish_query() {
+  if (promise_) {
+    auto page = [&]() -> std::string {
+      HttpAnswer A{"send", prefix_};
+      A << "<div class=\"row\"><form action=\"" << prefix_
+        << "send\" method=\"post\" enctype=\"multipart/form-data\"><div class=\"form-group-row\">"
+        << "<label for=\"filedata\">bag of cells</label>"
+        << "<input type=\"file\" class=\"form-control-file\" id=\"filedata\" name=\"filedata\">"
+        << "<button type=\"submit\" class=\"btn btn-primary\">send</button>"
+        << "</div></form></div>";
+      return A.finish();
+    }();
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
+  }
+  stop();
+}
+
+HttpQuerySend::HttpQuerySend(std::string prefix, td::BufferSlice data, td::Promise<MHD_Response *> promise)
+    : HttpQueryCommon(prefix, std::move(promise)), data_(std::move(data)) {
+}
+
+HttpQuerySend::HttpQuerySend(std::map<std::string, std::string> opts, std::string prefix,
+                             td::Promise<MHD_Response *> promise)
+    : HttpQueryCommon(prefix, std::move(promise)) {
+  auto it = opts.find("filedata");
+  if (it != opts.end()) {
+    data_ = td::BufferSlice{it->second};
+  } else {
+    error_ = td::Status::Error("no file data");
+    return;
+  }
+}
+
+void HttpQuerySend::start_up() {
+  if (error_.is_error()) {
+    abort_query(std::move(error_));
+    return;
+  }
+  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
+    if (R.is_error()) {
+      td::actor::send_closure(SelfId, &HttpQuerySend::abort_query, R.move_as_error());
+    } else {
+      td::actor::send_closure(SelfId, &HttpQuerySend::got_result, R.move_as_ok());
+    }
+  });
+  auto query =
+      ton::serialize_tl_object(ton::create_tl_object<ton::lite_api::liteServer_sendMessage>(std::move(data_)), true);
+  td::actor::send_closure(CoreActorInterface::instance_actor_id(), &CoreActorInterface::send_lite_query,
+                          std::move(query), std::move(P));
+}
+
+void HttpQuerySend::got_result(td::BufferSlice data) {
+  auto F = ton::fetch_tl_object<ton::lite_api::liteServer_sendMsgStatus>(std::move(data), true);
+  if (F.is_error()) {
+    abort_query(F.move_as_error());
+  } else {
+    status_ = F.move_as_ok()->status_;
+  }
+  finish_query();
+}
+
+void HttpQuerySend::finish_query() {
+  if (promise_) {
+    auto page = [&]() -> std::string {
+      HttpAnswer A{"send", prefix_};
+      if (status_ >= 0) {
+        A << HttpAnswer::Notification{"success"};
+      } else {
+        A << HttpAnswer::Error{td::Status::Error(status_, "failed")};
+      }
+      return A.finish();
+    }();
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
+  }
+  stop();
+}
+
+HttpQueryRunMethod::HttpQueryRunMethod(ton::BlockIdExt block_id, block::StdAddress addr, std::string method_name,
+                                       std::vector<vm::StackEntry> params, std::string prefix,
+                                       td::Promise<MHD_Response *> promise)
+    : HttpQueryCommon(std::move(prefix), std::move(promise))
+    , block_id_(block_id)
+    , addr_(addr)
+    , method_name_(std::move(method_name))
+    , params_(std::move(params)) {
+}
+
+HttpQueryRunMethod::HttpQueryRunMethod(std::map<std::string, std::string> opts, std::string prefix,
+                                       td::Promise<MHD_Response *> promise)
+    : HttpQueryCommon(std::move(prefix), std::move(promise)) {
+  auto R = parse_block_id(opts, true);
+  if (R.is_ok()) {
+    block_id_ = R.move_as_ok();
+    if (!block_id_.is_valid()) {
+      block_id_.id.workchain = ton::masterchainId;
+      block_id_.id.shard = ton::shardIdAll;
+      block_id_.id.seqno = static_cast<td::uint32>(0xffffffff);
+      block_id_.root_hash.set_zero();
+      block_id_.file_hash.set_zero();
+    }
+  } else {
+    error_ = R.move_as_error();
+    return;
+  }
+  auto R2 = parse_account_addr(opts);
+  if (R2.is_ok()) {
+    addr_ = R2.move_as_ok();
+  } else {
+    error_ = R2.move_as_error();
+    return;
+  }
+  auto it = opts.find("method");
+  if (it == opts.end()) {
+    error_ = td::Status::Error("no method");
+    return;
+  } else {
+    method_name_ = it->second;
+  }
+  it = opts.find("params");
+  if (it != opts.end()) {
+    auto R3 = vm::parse_stack_entries(it->second);
+    if (R3.is_error()) {
+      error_ = R3.move_as_error();
+      return;
+    }
+    params_ = R3.move_as_ok();
+  }
+}
+
+void HttpQueryRunMethod::start_up_query() {
+  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
+    if (R.is_error()) {
+      td::actor::send_closure(SelfId, &HttpQueryRunMethod::abort_query, R.move_as_error_prefix("litequery failed: "));
+    } else {
+      td::actor::send_closure(SelfId, &HttpQueryRunMethod::got_result, R.move_as_ok());
+    }
+  });
+
+  auto a = ton::create_tl_object<ton::lite_api::liteServer_accountId>(addr_.workchain, addr_.addr);
+  td::int64 method_id = (td::crc16(td::Slice{method_name_}) & 0xffff) | 0x10000;
+
+  // serialize params
+  vm::CellBuilder cb;
+  td::Ref<vm::Cell> cell;
+  if (!(vm::Stack{params_}.serialize(cb) && cb.finalize_to(cell))) {
+    return abort_query(td::Status::Error("cannot serialize stack with get-method parameters"));
+  }
+  auto params_serialized = vm::std_boc_serialize(std::move(cell));
+  if (params_serialized.is_error()) {
+    return abort_query(params_serialized.move_as_error_prefix("cannot serialize stack with get-method parameters : "));
+  }
+
+  auto query = ton::serialize_tl_object(
+      ton::create_tl_object<ton::lite_api::liteServer_runSmcMethod>(
+          0x17, ton::create_tl_lite_block_id(block_id_), std::move(a), method_id, params_serialized.move_as_ok()),
+      true);
+  td::actor::send_closure(CoreActorInterface::instance_actor_id(), &CoreActorInterface::send_lite_query,
+                          std::move(query), std::move(P));
+}
+
+void HttpQueryRunMethod::got_result(td::BufferSlice data) {
+  auto F = ton::fetch_tl_object<ton::lite_api::liteServer_runMethodResult>(std::move(data), true);
+  if (F.is_error()) {
+    return abort_query(F.move_as_error());
+  }
+  auto f = F.move_as_ok();
+  auto page = [&]() -> std::string {
+    HttpAnswer A{"account", prefix_};
+    A.set_account_id(addr_);
+    A.set_block_id(ton::create_block_id(f->id_));
+    if (f->exit_code_ != 0) {
+      A.abort(PSTRING() << "VM terminated with error code " << f->exit_code_);
+      return A.finish();
+    }
+
+    std::ostringstream os;
+    os << "result: ";
+    if (f->result_.empty()) {
+      os << "<none>";
+    } else {
+      auto r_cell = vm::std_boc_deserialize(f->result_);
+      if (r_cell.is_error()) {
+        A.abort(PSTRING() << "cannot deserialize VM result boc: " << r_cell.move_as_error());
+        return A.finish();
+      }
+      auto cs = vm::load_cell_slice(r_cell.move_as_ok());
+      td::Ref<vm::Stack> stack;
+      if (!(vm::Stack::deserialize_to(cs, stack, 0) && cs.empty_ext())) {
+        A.abort("VM result boc cannot be deserialized");
+        return A.finish();
+      }
+      stack->dump(os, 3);
+    }
+    A << HttpAnswer::CodeBlock{os.str()};
+    return A.finish();
+  }();
+  auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+  MHD_add_response_header(R, "Content-Type", "text/html");
+  promise_.set_value(std::move(R));
+  stop();
+}
 HttpQueryStatus::HttpQueryStatus(std::string prefix, td::Promise<MHD_Response *> promise)
     : HttpQueryCommon(std::move(prefix), std::move(promise)) {
 }
@@ -998,14 +1432,14 @@ void HttpQueryStatus::finish_query() {
       for (td::uint32 i = 0; i < results_.ips.size(); i++) {
         A << "<tr>";
         if (results_.ips[i].is_valid()) {
-          A << "<td>" << results_.ips[i] << "</td>";
+          A << "<td>" << results_.ips[i].get_ip_str() << ":" << results_.ips[i].get_port() << "</td>";
         } else {
           A << "<td>hidden</td>";
         }
         td::uint32 j = 0;
         for (auto &X : results_.results) {
           if (!X->values_[i].is_valid()) {
-            A << "<td>FAIL</td>";
+            A << "<td class=\"table-danger\">FAIL</td>";
           } else {
             if (m[j].count(X->values_[i].id.seqno) == 0) {
               m[j].insert(X->values_[i].id.seqno);
@@ -1022,8 +1456,9 @@ void HttpQueryStatus::finish_query() {
       A << "</table></div>";
       return A.finish();
     }();
-    promise_.set_value(
-        MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY));
+    auto R = MHD_create_response_from_buffer(page.length(), const_cast<char *>(page.c_str()), MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(R, "Content-Type", "text/html");
+    promise_.set_value(std::move(R));
   }
   stop();
 }

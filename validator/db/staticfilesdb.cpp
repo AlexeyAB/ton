@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "staticfilesdb.hpp"
 #include "files-async.hpp"
@@ -25,7 +25,9 @@ namespace validator {
 
 void StaticFilesDb::load_file(FileHash file_hash, td::Promise<td::BufferSlice> promise) {
   auto path = path_ + "/" + file_hash.to_hex();
-  td::actor::create_actor<db::ReadFile>("read file", path, std::move(promise)).release();
+  td::actor::create_actor<db::ReadFile>("read file", path, 0, -1, db::ReadFile::Flags::f_disable_log,
+                                        std::move(promise))
+      .release();
 }
 
 }  // namespace validator

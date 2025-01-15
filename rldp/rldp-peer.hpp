@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -87,7 +87,7 @@ class RldpTransferReceiverImpl : public RldpTransferReceiver {
                     td::BufferSlice data) override;
   void alarm() override;
   void start_up() override {
-    data_ = td::BufferSlice(total_size_);
+    data_ = td::BufferSlice(td::narrow_cast<size_t>(total_size_));
   }
 
   RldpTransferReceiverImpl(TransferId transfer_id, adnl::AdnlNodeIdShort local_id, adnl::AdnlNodeIdShort peer_id,

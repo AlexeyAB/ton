@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -32,6 +32,7 @@ namespace validator {
 
 class ValidatorSetQ : public ValidatorSet {
  public:
+  const ValidatorDescr* get_validator(const NodeIdShort& id) const override;
   bool is_validator(NodeIdShort id) const override;
   CatchainSeqno get_catchain_seqno() const override {
     return cc_seqno_;
@@ -62,8 +63,6 @@ class ValidatorSetQ : public ValidatorSet {
   ValidatorWeight total_weight_;
   std::vector<ValidatorDescr> ids_;
   std::vector<std::pair<NodeIdShort, size_t>> ids_map_;
-
-  const ValidatorDescr* find_validator(const NodeIdShort& id) const;
 };
 
 class ValidatorSetCompute {

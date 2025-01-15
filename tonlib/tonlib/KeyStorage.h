@@ -14,12 +14,14 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
 #include "td/utils/Status.h"
 #include "td/utils/SharedSlice.h"
+
+#include "KeyValue.h"
 
 #include <string>
 
@@ -44,34 +46,42 @@ class KeyStorage {
   struct ExportedEncryptedKey {
     td::SecureString data;
   };
+  struct ExportedUnencryptedKey {
+    td::SecureString data;
+  };
   struct PrivateKey {
     td::SecureString private_key;
   };
 
-  td::Status set_directory(std::string directory);
+  void set_key_value(std::shared_ptr<KeyValue> kv);
 
-  td::Result<Key> create_new_key(td::Slice local_password, td::Slice key_password);
+  td::Result<Key> create_new_key(td::Slice local_password, td::Slice key_password, td::Slice entropy);
 
   td::Result<ExportedKey> export_key(InputKey input_key);
   td::Result<ExportedPemKey> export_pem_key(InputKey input_key, td::Slice key_password);
   td::Result<ExportedEncryptedKey> export_encrypted_key(InputKey input_key, td::Slice key_password);
+  td::Result<ExportedUnencryptedKey> export_unencrypted_key(InputKey input_key);
   td::Result<Key> change_local_password(InputKey input_key, td::Slice new_local_password);
 
-  td::Status delete_key(td::Slice public_key);
+  td::Status delete_key(const Key& key);
+  td::Status delete_all_keys();
 
   td::Result<Key> import_key(td::Slice local_password, td::Slice mnemonic_password, ExportedKey exported_key);
   td::Result<Key> import_pem_key(td::Slice local_password, td::Slice key_password, ExportedPemKey exported_key);
   td::Result<Key> import_encrypted_key(td::Slice local_password, td::Slice key_password,
                                        ExportedEncryptedKey exported_key);
+  td::Result<Key> import_unencrypted_key(td::Slice local_password, ExportedUnencryptedKey exported_key);
 
   td::Result<PrivateKey> load_private_key(InputKey input_key);
 
+  static PrivateKey fake_private_key();
+  static InputKey fake_input_key();
+  static bool is_fake_input_key(InputKey& input_key);
+
  private:
-  std::string directory_;
+  std::shared_ptr<KeyValue> kv_;
 
   td::Result<Key> save_key(const DecryptedKey& mnemonic, td::Slice local_password);
   td::Result<DecryptedKey> export_decrypted_key(InputKey input_key);
-
-  std::string to_file_path(td::Slice public_key);
 };
 }  // namespace tonlib

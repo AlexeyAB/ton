@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -24,6 +24,7 @@
 #include "td/actor/core/ActorMessage.h"
 #include "td/actor/core/ActorSignals.h"
 #include "td/actor/core/ActorState.h"
+#include "td/actor/core/ActorTypeStat.h"
 #include "td/actor/core/SchedulerContext.h"
 
 #include "td/utils/format.h"
@@ -42,8 +43,14 @@ class ActorExecutor {
       this->has_poll = new_has_poll;
       return *this;
     }
+    Options &with_signals(ActorSignals signals) {
+      this->signals = signals;
+      return *this;
+    }
+
     bool from_queue{false};
     bool has_poll{false};
+    ActorSignals signals;
   };
 
   ActorExecutor(ActorInfo &actor_info, SchedulerDispatcher &dispatcher, Options options)
@@ -89,6 +96,7 @@ class ActorExecutor {
   ActorInfo &actor_info_;
   SchedulerDispatcher &dispatcher_;
   Options options_;
+  ActorTypeStatRef actor_stats_;
   ActorLocker actor_locker_{&actor_info_.state(), ActorLocker::Options()
                                                       .with_can_execute_paused(options_.from_queue)
                                                       .with_is_shared(!options_.has_poll)
@@ -106,8 +114,8 @@ class ActorExecutor {
     return flags_;
   }
 
-  void start();
-  void finish();
+  void start() noexcept;
+  void finish() noexcept;
 
   bool flush_one(ActorSignals &signals);
   bool flush_one_signal(ActorSignals &signals);

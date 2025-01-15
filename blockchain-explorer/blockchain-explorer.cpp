@@ -23,12 +23,12 @@
     from all source files in the program, then also delete it here.
     along with TON Blockchain.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "adnl/adnl-ext-client.h"
 #include "adnl/utils.hpp"
 #include "auto/tl/ton_api_json.h"
-#include "td/utils/OptionsParser.h"
+#include "td/utils/OptionParser.h"
 #include "td/utils/Time.h"
 #include "td/utils/filesystem.h"
 #include "td/utils/format.h"
@@ -49,9 +49,15 @@
 #include "blockchain-explorer-http.hpp"
 #include "blockchain-explorer-query.hpp"
 
+#include "vm/boc.h"
+#include "vm/cellops.h"
+#include "vm/cells/MerkleProof.h"
+#include "vm/vm.h"
+
 #include "auto/tl/lite_api.h"
 #include "ton/lite-tl.hpp"
 #include "tl-utils/lite-utils.hpp"
+#include "lite-client/ext-client.h"
 
 #include <microhttpd.h>
 
@@ -98,30 +104,31 @@ class HttpQueryRunner {
         Self->finish(nullptr);
       }
     });
-    mutex_.lock();
     scheduler_ptr->run_in_context_external([&]() { func(std::move(P)); });
   }
   void finish(MHD_Response* response) {
+    std::unique_lock<std::mutex> lock(mutex_);
     response_ = response;
-    mutex_.unlock();
+    cond.notify_all();
   }
   MHD_Response* wait() {
-    mutex_.lock();
-    mutex_.unlock();
+    std::unique_lock<std::mutex> lock(mutex_);
+    cond.wait(lock, [&]() { return response_ != nullptr; });
     return response_;
   }
 
  private:
   std::function<void(td::Promise<MHD_Response*>)> func_;
-  MHD_Response* response_;
+  MHD_Response* response_ = nullptr;
   std::mutex mutex_;
+  std::condition_variable cond;
 };
 
 class CoreActor : public CoreActorInterface {
  private:
   std::string global_config_ = "ton-global.config";
 
-  std::vector<td::actor::ActorOwn<ton::adnl::AdnlExtClient>> clients_;
+  td::actor::ActorOwn<liteclient::ExtClient> client_;
 
   td::uint32 http_port_ = 80;
   MHD_Daemon* daemon_ = nullptr;
@@ -131,35 +138,29 @@ class CoreActor : public CoreActorInterface {
 
   bool hide_ips_ = false;
 
-  std::unique_ptr<ton::adnl::AdnlExtClient::Callback> make_callback(td::uint32 idx) {
-    class Callback : public ton::adnl::AdnlExtClient::Callback {
+  td::unique_ptr<liteclient::ExtClient::Callback> make_callback() {
+    class Callback : public liteclient::ExtClient::Callback {
      public:
-      void on_ready() override {
-        td::actor::send_closure(id_, &CoreActor::conn_ready, idx_);
-      }
-      void on_stop_ready() override {
-        td::actor::send_closure(id_, &CoreActor::conn_closed, idx_);
-      }
-      Callback(td::actor::ActorId<CoreActor> id, td::uint32 idx) : id_(std::move(id)), idx_(idx) {
+      Callback(td::actor::ActorId<CoreActor> id) : id_(std::move(id)) {
       }
 
      private:
       td::actor::ActorId<CoreActor> id_;
-      td::uint32 idx_;
     };
 
-    return std::make_unique<Callback>(actor_id(this), idx);
+    return td::make_unique<Callback>(actor_id(this));
   }
 
   std::shared_ptr<RemoteNodeStatus> new_result_;
   td::int32 attempt_ = 0;
   td::int32 waiting_ = 0;
 
-  std::vector<bool> ready_;
+  size_t n_servers_ = 0;
 
   void run_queries();
-  void got_result(td::uint32 idx, td::int32 attempt, td::Result<td::BufferSlice> data);
-  void send_query(td::uint32 idx);
+  void got_servers_ready(td::int32 attempt, std::vector<bool> ready);
+  void send_ping(td::uint32 idx);
+  void got_ping_result(td::uint32 idx, td::int32 attempt, td::Result<td::BufferSlice> data);
 
   void add_result() {
     if (new_result_) {
@@ -190,12 +191,6 @@ class CoreActor : public CoreActorInterface {
   static CoreActor* instance_;
   td::actor::ActorId<CoreActor> self_id_;
 
-  void conn_ready(td::uint32 idx) {
-    ready_.at(idx) = true;
-  }
-  void conn_closed(td::uint32 idx) {
-    ready_.at(idx) = false;
-  }
   void set_global_config(std::string str) {
     global_config_ = str;
   }
@@ -220,10 +215,7 @@ class CoreActor : public CoreActorInterface {
     hide_ips_ = value;
   }
 
-  void send_lite_query(td::uint32 idx, td::BufferSlice query, td::Promise<td::BufferSlice> promise);
-  void send_lite_query(td::BufferSlice data, td::Promise<td::BufferSlice> promise) override {
-    return send_lite_query(0, std::move(data), std::move(promise));
-  }
+  void send_lite_query(td::BufferSlice query, td::Promise<td::BufferSlice> promise) override;
   void get_last_result(td::Promise<std::shared_ptr<RemoteNodeStatus>> promise) override {
   }
   void get_results(td::uint32 max, td::Promise<RemoteNodeStatusList> promise) override {
@@ -255,7 +247,7 @@ class CoreActor : public CoreActorInterface {
   CoreActor() {
   }
 
-  static int get_arg_iterate(void* cls, enum MHD_ValueKind kind, const char* key, const char* value) {
+  static MHD_RESULT get_arg_iterate(void* cls, enum MHD_ValueKind kind, const char* key, const char* value) {
     auto X = static_cast<std::map<std::string, std::string>*>(cls);
     if (key && value && std::strlen(key) > 0 && std::strlen(value) > 0) {
       X->emplace(key, urldecode(td::Slice{value}, false));
@@ -263,22 +255,80 @@ class CoreActor : public CoreActorInterface {
     return MHD_YES;
   }
 
-  static int process_http_request(void* cls, struct MHD_Connection* connection, const char* url, const char* method,
-                                  const char* version, const char* upload_data, size_t* upload_data_size, void** ptr) {
-    static int dummy;
-    struct MHD_Response* response = nullptr;
-    int ret;
-
-    if (0 != std::strcmp(method, "GET"))
-      return MHD_NO; /* unexpected method */
-    if (&dummy != *ptr) {
-      /* The first time only the headers are valid,
-         do not respond in the first round... */
-      *ptr = &dummy;
+  struct HttpRequestExtra {
+    HttpRequestExtra(MHD_Connection* connection, bool is_post) {
+      if (is_post) {
+        postprocessor = MHD_create_post_processor(connection, 1 << 14, iterate_post, static_cast<void*>(this));
+      }
+    }
+    ~HttpRequestExtra() {
+      MHD_destroy_post_processor(postprocessor);
+    }
+    static MHD_RESULT iterate_post(void* coninfo_cls, enum MHD_ValueKind kind, const char* key, const char* filename,
+                            const char* content_type, const char* transfer_encoding, const char* data, uint64_t off,
+                            size_t size) {
+      auto ptr = static_cast<HttpRequestExtra*>(coninfo_cls);
+      ptr->total_size += strlen(key) + size;
+      if (ptr->total_size > MAX_POST_SIZE) {
+        return MHD_NO;
+      }
+      std::string k = key;
+      if (ptr->opts[k].size() < off + size) {
+        ptr->opts[k].resize(off + size);
+      }
+      td::MutableSlice(ptr->opts[k]).remove_prefix(off).copy_from(td::Slice(data, size));
       return MHD_YES;
     }
-    if (0 != *upload_data_size)
-      return MHD_NO; /* upload data in a GET!? */
+    MHD_PostProcessor* postprocessor;
+    std::map<std::string, std::string> opts;
+    td::uint64 total_size = 0;
+  };
+
+  static void request_completed(void* cls, struct MHD_Connection* connection, void** ptr,
+                                enum MHD_RequestTerminationCode toe) {
+    auto e = static_cast<HttpRequestExtra*>(*ptr);
+    if (e) {
+      delete e;
+    }
+  }
+
+  static MHD_RESULT process_http_request(void* cls, struct MHD_Connection* connection, const char* url, const char* method,
+                                  const char* version, const char* upload_data, size_t* upload_data_size, void** ptr) {
+    struct MHD_Response* response = nullptr;
+    MHD_RESULT ret;
+
+    bool is_post = false;
+    if (std::strcmp(method, "GET") == 0) {
+      is_post = false;
+    } else if (std::strcmp(method, "POST") == 0) {
+      is_post = true;
+    } else {
+      return MHD_NO; /* unexpected method */
+    }
+    std::map<std::string, std::string> opts;
+    if (!is_post) {
+      if (!*ptr) {
+        *ptr = static_cast<void*>(new HttpRequestExtra{connection, false});
+        return MHD_YES;
+      }
+      if (0 != *upload_data_size)
+        return MHD_NO; /* upload data in a GET!? */
+    } else {
+      if (!*ptr) {
+        *ptr = static_cast<void*>(new HttpRequestExtra{connection, true});
+        return MHD_YES;
+      }
+      auto e = static_cast<HttpRequestExtra*>(*ptr);
+      if (0 != *upload_data_size) {
+        CHECK(e->postprocessor);
+        MHD_post_process(e->postprocessor, upload_data, *upload_data_size);
+        *upload_data_size = 0;
+        return MHD_YES;
+      }
+      for (auto& o : e->opts) {
+        opts[o.first] = std::move(o.second);
+      }
+    }
 
     std::string url_s = url;
 
@@ -295,7 +345,6 @@ class CoreActor : public CoreActorInterface {
       command = url_s.substr(pos + 1);
     }
 
-    std::map<std::string, std::string> opts;
     MHD_get_connection_values(connection, MHD_GET_ARGUMENT_KIND, get_arg_iterate, static_cast<void*>(&opts));
 
     if (command == "status") {
@@ -352,6 +401,26 @@ class CoreActor : public CoreActorInterface {
             .release();
       }};
       response = g.wait();
+    } else if (command == "config") {
+      HttpQueryRunner g{[&](td::Promise<MHD_Response*> promise) {
+        td::actor::create_actor<HttpQueryConfig>("getconfig", opts, prefix, std::move(promise)).release();
+      }};
+      response = g.wait();
+    } else if (command == "send") {
+      HttpQueryRunner g{[&](td::Promise<MHD_Response*> promise) {
+        td::actor::create_actor<HttpQuerySend>("send", opts, prefix, std::move(promise)).release();
+      }};
+      response = g.wait();
+    } else if (command == "sendform") {
+      HttpQueryRunner g{[&](td::Promise<MHD_Response*> promise) {
+        td::actor::create_actor<HttpQuerySendForm>("sendform", opts, prefix, std::move(promise)).release();
+      }};
+      response = g.wait();
+    } else if (command == "runmethod") {
+      HttpQueryRunner g{[&](td::Promise<MHD_Response*> promise) {
+        td::actor::create_actor<HttpQueryRunMethod>("runmethod", opts, prefix, std::move(promise)).release();
+      }};
+      response = g.wait();
     } else {
       ret = MHD_NO;
     }
@@ -366,40 +435,74 @@ class CoreActor : public CoreActorInterface {
   }
 
   void run() {
+    std::vector<liteclient::LiteServerConfig> servers;
     if (remote_public_key_.empty()) {
       auto G = td::read_file(global_config_).move_as_ok();
       auto gc_j = td::json_decode(G.as_slice()).move_as_ok();
       ton::ton_api::liteclient_config_global gc;
       ton::ton_api::from_json(gc, gc_j.get_object()).ensure();
-
-      CHECK(gc.liteservers_.size() > 0);
-      td::uint32 size = static_cast<td::uint32>(gc.liteservers_.size());
-      ready_.resize(size, false);
-
-      for (td::uint32 i = 0; i < size; i++) {
-        auto& cli = gc.liteservers_[i];
-        td::IPAddress addr;
-        addr.init_host_port(td::IPAddress::ipv4_to_str(cli->ip_), cli->port_).ensure();
-        addrs_.push_back(addr);
-        clients_.emplace_back(ton::adnl::AdnlExtClient::create(ton::adnl::AdnlNodeIdFull::create(cli->id_).move_as_ok(),
-                                                               addr, make_callback(i)));
+      auto r_servers = liteclient::LiteServerConfig::parse_global_config(gc);
+      r_servers.ensure();
+      servers = r_servers.move_as_ok();
+      for (const auto& serv : servers) {
+        addrs_.push_back(serv.addr);
       }
     } else {
       if (!remote_addr_.is_valid()) {
         LOG(FATAL) << "remote addr not set";
       }
-      ready_.resize(1, false);
       addrs_.push_back(remote_addr_);
-      clients_.emplace_back(ton::adnl::AdnlExtClient::create(ton::adnl::AdnlNodeIdFull{remote_public_key_},
-                                                             remote_addr_, make_callback(0)));
+      servers.push_back(liteclient::LiteServerConfig{ton::adnl::AdnlNodeIdFull{remote_public_key_}, remote_addr_});
     }
-    daemon_ = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, static_cast<td::uint16>(http_port_), nullptr, nullptr,
-                               &process_http_request, nullptr, MHD_OPTION_END);
+    n_servers_ = servers.size();
+    client_ = liteclient::ExtClient::create(std::move(servers), make_callback(), true);
+    daemon_ = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, static_cast<td::uint16>(http_port_), nullptr, nullptr,
+                               &process_http_request, nullptr, MHD_OPTION_NOTIFY_COMPLETED, request_completed, nullptr,
+                               MHD_OPTION_THREAD_POOL_SIZE, 16, MHD_OPTION_END);
     CHECK(daemon_ != nullptr);
   }
 };
 
-void CoreActor::got_result(td::uint32 idx, td::int32 attempt, td::Result<td::BufferSlice> R) {
+void CoreActor::run_queries() {
+  waiting_ = 0;
+  new_result_ = std::make_shared<RemoteNodeStatus>(n_servers_, td::Timestamp::at_unix(attempt_ * 60));
+  td::actor::send_closure(client_, &liteclient::ExtClient::get_servers_status,
+                          [SelfId = actor_id(this), attempt = attempt_](td::Result<std::vector<bool>> R) {
+                            R.ensure();
+                            td::actor::send_closure(SelfId, &CoreActor::got_servers_ready, attempt, R.move_as_ok());
+                          });
+}
+
+void CoreActor::got_servers_ready(td::int32 attempt, std::vector<bool> ready) {
+  if (attempt != attempt_) {
+    return;
+  }
+  CHECK(ready.size() == n_servers_);
+  for (td::uint32 i = 0; i < n_servers_; i++) {
+    if (ready[i]) {
+      send_ping(i);
+    }
+  }
+  CHECK(waiting_ >= 0);
+  if (waiting_ == 0) {
+    add_result();
+  }
+}
+
+void CoreActor::send_ping(td::uint32 idx) {
+  waiting_++;
+  auto query = ton::create_tl_object<ton::lite_api::liteServer_getMasterchainInfo>();
+  auto q = ton::create_tl_object<ton::lite_api::liteServer_query>(serialize_tl_object(query, true));
+
+  auto P =
+      td::PromiseCreator::lambda([SelfId = actor_id(this), idx, attempt = attempt_](td::Result<td::BufferSlice> R) {
+        td::actor::send_closure(SelfId, &CoreActor::got_ping_result, idx, attempt, std::move(R));
+      });
+  td::actor::send_closure(client_, &liteclient::ExtClient::send_query_to_server, "query", serialize_tl_object(q, true),
+                          idx, td::Timestamp::in(10.0), std::move(P));
+}
+
+void CoreActor::got_ping_result(td::uint32 idx, td::int32 attempt, td::Result<td::BufferSlice> R) {
   if (attempt != attempt_) {
     return;
   }
@@ -440,39 +543,7 @@ void CoreActor::got_result(td::uint32 idx, td::int32 attempt, td::Result<td::Buf
   }
 }
 
-void CoreActor::send_query(td::uint32 idx) {
-  if (!ready_[idx]) {
-    return;
-  }
-  waiting_++;
-  auto query = ton::create_tl_object<ton::lite_api::liteServer_getMasterchainInfo>();
-  auto q = ton::create_tl_object<ton::lite_api::liteServer_query>(serialize_tl_object(query, true));
-
-  auto P =
-      td::PromiseCreator::lambda([SelfId = actor_id(this), idx, attempt = attempt_](td::Result<td::BufferSlice> R) {
-        td::actor::send_closure(SelfId, &CoreActor::got_result, idx, attempt, std::move(R));
-      });
-  td::actor::send_closure(clients_[idx], &ton::adnl::AdnlExtClient::send_query, "query", serialize_tl_object(q, true),
-                          td::Timestamp::in(10.0), std::move(P));
-}
-
-void CoreActor::run_queries() {
-  waiting_ = 0;
-  new_result_ = std::make_shared<RemoteNodeStatus>(ready_.size(), td::Timestamp::at_unix(attempt_ * 60));
-  for (td::uint32 i = 0; i < ready_.size(); i++) {
-    send_query(i);
-  }
-  CHECK(waiting_ >= 0);
-  if (waiting_ == 0) {
-    add_result();
-  }
-}
-
-void CoreActor::send_lite_query(td::uint32 idx, td::BufferSlice query, td::Promise<td::BufferSlice> promise) {
-  if (!ready_[idx]) {
-    promise.set_error(td::Status::Error(ton::ErrorCode::notready, "ext conn not ready"));
-    return;
-  }
+void CoreActor::send_lite_query(td::BufferSlice query, td::Promise<td::BufferSlice> promise) {
   auto P = td::PromiseCreator::lambda([promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
     if (R.is_error()) {
       promise.set_error(R.move_as_error());
@@ -490,7 +561,7 @@ void CoreActor::send_lite_query(td::uint32 idx, td::BufferSlice query, td::Promi
     promise.set_value(std::move(B));
   });
   auto q = ton::create_tl_object<ton::lite_api::liteServer_query>(std::move(query));
-  td::actor::send_closure(clients_[idx], &ton::adnl::AdnlExtClient::send_query, "query", serialize_tl_object(q, true),
+  td::actor::send_closure(client_, &liteclient::ExtClient::send_query, "query", serialize_tl_object(q, true),
                           td::Timestamp::in(10.0), std::move(P));
 }
 
@@ -508,9 +579,9 @@ int main(int argc, char* argv[]) {
 
   td::actor::ActorOwn<CoreActor> x;
 
-  td::OptionsParser p;
+  td::OptionParser p;
   p.set_description("TON Blockchain explorer");
-  p.add_option('h', "help", "prints_help", [&]() {
+  p.add_checked_option('h', "help", "prints_help", [&]() {
     char b[10240];
     td::StringBuilder sb(td::MutableSlice{b, 10000});
     sb << p;
@@ -518,31 +589,31 @@ int main(int argc, char* argv[]) {
     std::exit(2);
     return td::Status::OK();
   });
-  p.add_option('I', "hide-ips", "hides ips from status", [&]() {
+  p.add_checked_option('I', "hide-ips", "hides ips from status", [&]() {
     td::actor::send_closure(x, &CoreActor::set_hide_ips, true);
     return td::Status::OK();
   });
-  p.add_option('u', "user", "change user", [&](td::Slice user) { return td::change_user(user); });
-  p.add_option('C', "global-config", "file to read global config", [&](td::Slice fname) {
+  p.add_checked_option('u', "user", "change user", [&](td::Slice user) { return td::change_user(user.str()); });
+  p.add_checked_option('C', "global-config", "file to read global config", [&](td::Slice fname) {
     td::actor::send_closure(x, &CoreActor::set_global_config, fname.str());
     return td::Status::OK();
   });
-  p.add_option('a', "addr", "connect to ip:port", [&](td::Slice arg) {
+  p.add_checked_option('a', "addr", "connect to ip:port", [&](td::Slice arg) {
     td::IPAddress addr;
     TRY_STATUS(addr.init_host_port(arg.str()));
     td::actor::send_closure(x, &CoreActor::set_remote_addr, addr);
     return td::Status::OK();
   });
-  p.add_option('p', "pub", "remote public key", [&](td::Slice arg) {
+  p.add_checked_option('p', "pub", "remote public key", [&](td::Slice arg) {
     td::actor::send_closure(x, &CoreActor::set_remote_public_key, td::BufferSlice{arg});
     return td::Status::OK();
   });
-  p.add_option('v', "verbosity", "set verbosity level", [&](td::Slice arg) {
+  p.add_checked_option('v', "verbosity", "set verbosity level", [&](td::Slice arg) {
     verbosity = td::to_integer<int>(arg);
     SET_VERBOSITY_LEVEL(VERBOSITY_NAME(FATAL) + verbosity);
     return (verbosity >= 0 && verbosity <= 9) ? td::Status::OK() : td::Status::Error("verbosity must be 0..9");
   });
-  p.add_option('d', "daemonize", "set SIGHUP", [&]() {
+  p.add_checked_option('d', "daemonize", "set SIGHUP", [&]() {
     td::set_signal_handler(td::SignalType::HangUp, [](int sig) {
 #if TD_DARWIN || TD_LINUX
       close(0);
@@ -551,12 +622,16 @@ int main(int argc, char* argv[]) {
     }).ensure();
     return td::Status::OK();
   });
-  p.add_option('H', "http-port", "listen on http port", [&](td::Slice arg) {
+  p.add_checked_option('H', "http-port", "listen on http port", [&](td::Slice arg) {
     td::actor::send_closure(x, &CoreActor::set_http_port, td::to_integer<td::uint32>(arg));
     return td::Status::OK();
   });
+  p.add_checked_option('L', "local-scripts", "use local copy of ajax/bootstrap/... JS", [&]() {
+    local_scripts = true;
+    return td::Status::OK();
+  });
 #if TD_DARWIN || TD_LINUX
-  p.add_option('l', "logname", "log to file", [&](td::Slice fname) {
+  p.add_checked_option('l', "logname", "log to file", [&](td::Slice fname) {
     auto FileLog = td::FileFd::open(td::CSlice(fname.str().c_str()),
                                     td::FileFd::Flags::Create | td::FileFd::Flags::Append | td::FileFd::Flags::Write)
                        .move_as_ok();
@@ -566,6 +641,8 @@ int main(int argc, char* argv[]) {
     return td::Status::OK();
   });
 #endif
+
+  vm::init_vm().ensure();
 
   td::actor::Scheduler scheduler({2});
   scheduler_ptr = &scheduler;

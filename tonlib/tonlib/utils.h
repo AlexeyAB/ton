@@ -14,13 +14,17 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "vm/cells.h"
 #include "ton/ton-types.h"
 #include "block/block.h"
 #include "block/block-parse.h"
+
 namespace tonlib {
-td::Result<td::Ref<vm::CellSlice>> binary_bitstring_to_cellslice(td::Slice literal);
+extern int VERBOSITY_NAME(tonlib_query);
+extern int VERBOSITY_NAME(last_block);
+extern int VERBOSITY_NAME(last_config);
+extern int VERBOSITY_NAME(lite_server);
 }  // namespace tonlib

@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -36,12 +36,11 @@ class ShardClient : public td::actor::Actor {
 
   bool waiting_ = false;
   bool init_mode_ = false;
+  bool started_ = false;
 
   td::actor::ActorId<ValidatorManager> manager_;
 
   td::Promise<td::Unit> promise_;
-
-  std::set<ShardIdFull> created_overlays_;
 
  public:
   ShardClient(td::Ref<ValidatorManagerOptions> opts, BlockHandle masterchain_block_handle,
@@ -54,27 +53,22 @@ class ShardClient : public td::actor::Actor {
       , promise_(std::move(promise)) {
     init_mode_ = true;
   }
-  ShardClient(td::Ref<ValidatorManagerOptions> opts, td::actor::ActorId<ValidatorManager> manager)
-      : opts_(std::move(opts)), manager_(manager) {
+  ShardClient(td::Ref<ValidatorManagerOptions> opts, td::actor::ActorId<ValidatorManager> manager,
+              td::Promise<td::Unit> promise)
+      : opts_(std::move(opts)), manager_(manager), promise_(std::move(promise)) {
   }
 
   static constexpr td::uint32 shard_client_priority() {
     return 2;
   }
 
-  void build_shard_overlays();
-
   void start_up() override;
   void start_up_init_mode();
-  void start_up_init_mode_finished();
+  void download_shard_states(BlockIdExt masterchain_block_id, std::vector<BlockIdExt> shards, size_t idx);
+  void start();
   void got_state_from_db(BlockIdExt masterchain_block_id);
-
-  void im_download_shard_state(BlockIdExt block_id, td::Promise<td::Unit> promise);
-  void im_downloaded_zero_state(BlockIdExt block_id, td::BufferSlice data, td::Promise<td::Unit> promise);
-  void im_downloaded_proof_link(BlockIdExt block_id, td::BufferSlice data, td::Promise<td::Unit> promise);
-  void im_checked_proof_link(BlockIdExt block_id, td::Promise<td::Unit> promise);
-  void im_downloaded_shard_state(BlockIdExt block_id, td::Promise<td::Unit> promise);
-  void im_got_shard_handle(BlockHandle handle, td::Promise<td::Unit> promise);
+  void got_init_handle_from_db(BlockHandle handle);
+  void got_init_state_from_db(td::Ref<MasterchainState> state);
 
   void new_masterchain_block_id(BlockIdExt masterchain_block_id);
   void got_masterchain_block_handle(BlockHandle handle);
@@ -88,6 +82,12 @@ class ShardClient : public td::actor::Actor {
   void new_masterchain_block_notification(BlockHandle handle, td::Ref<MasterchainState> state);
 
   void get_processed_masterchain_block(td::Promise<BlockSeqno> promise);
+  void get_processed_masterchain_block_id(td::Promise<BlockIdExt> promise);
+
+  void force_update_shard_client(BlockHandle handle, td::Promise<td::Unit> promise);
+  void force_update_shard_client_ex(BlockHandle handle, td::Ref<MasterchainState> state, td::Promise<td::Unit> promise);
+
+  void update_options(td::Ref<ValidatorManagerOptions> opts);
 };
 
 }  // namespace validator

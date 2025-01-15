@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "vm/cells/CellTraits.h"
@@ -74,13 +74,17 @@ struct CellHash {
 };
 }  // namespace vm
 
+inline size_t cell_hash_slice_hash(td::Slice hash) {
+  // use offset 8, because in db keys are grouped by first bytes.
+  return td::as<size_t>(hash.substr(8, 8).ubegin());
+}
 namespace std {
 template <>
 struct hash<vm::CellHash> {
   typedef vm::CellHash argument_type;
   typedef std::size_t result_type;
   result_type operator()(argument_type const& s) const noexcept {
-    return td::as<size_t>(s.as_slice().ubegin());
+    return cell_hash_slice_hash(s.as_slice());
   }
 };
 }  // namespace std

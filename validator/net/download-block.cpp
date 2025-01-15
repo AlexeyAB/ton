@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "download-block.hpp"
 #include "ton/ton-tl.hpp"
@@ -34,7 +34,8 @@ DownloadBlock::DownloadBlock(BlockIdExt block_id, adnl::AdnlNodeIdShort local_id
                              adnl::AdnlNodeIdShort download_from, td::uint32 priority, td::Timestamp timeout,
                              td::actor::ActorId<ValidatorManagerInterface> validator_manager,
                              td::actor::ActorId<rldp::Rldp> rldp, td::actor::ActorId<overlay::Overlays> overlays,
-                             td::actor::ActorId<adnl::Adnl> adnl, td::Promise<ReceivedBlock> promise)
+                             td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<adnl::AdnlExtClient> client,
+                             td::Promise<ReceivedBlock> promise)
     : block_id_(block_id)
     , local_id_(local_id)
     , overlay_id_(overlay_id)
@@ -45,6 +46,7 @@ DownloadBlock::DownloadBlock(BlockIdExt block_id, adnl::AdnlNodeIdShort local_id
     , rldp_(rldp)
     , overlays_(overlays)
     , adnl_(adnl)
+    , client_(client)
     , promise_(std::move(promise))
     , block_{block_id, td::BufferSlice()}
     , allow_partial_proof_{!block_id_.is_masterchain()} {
@@ -54,7 +56,8 @@ DownloadBlock::DownloadBlock(BlockIdExt block_id, adnl::AdnlNodeIdShort local_id
                              BlockHandle prev, adnl::AdnlNodeIdShort download_from, td::uint32 priority,
                              td::Timestamp timeout, td::actor::ActorId<ValidatorManagerInterface> validator_manager,
                              td::actor::ActorId<rldp::Rldp> rldp, td::actor::ActorId<overlay::Overlays> overlays,
-                             td::actor::ActorId<adnl::Adnl> adnl, td::Promise<ReceivedBlock> promise)
+                             td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<adnl::AdnlExtClient> client,
+                             td::Promise<ReceivedBlock> promise)
     : block_id_(block_id)
     , local_id_(local_id)
     , overlay_id_(overlay_id)
@@ -66,6 +69,7 @@ DownloadBlock::DownloadBlock(BlockIdExt block_id, adnl::AdnlNodeIdShort local_id
     , rldp_(rldp)
     , overlays_(overlays)
     , adnl_(adnl)
+    , client_(client)
     , promise_(std::move(promise))
     , block_{block_id, td::BufferSlice()} {
 }
@@ -124,7 +128,7 @@ void DownloadBlock::got_block_handle(BlockHandle handle) {
     return;
   }
 
-  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<std::unique_ptr<DownloadToken>> R) {
+  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<std::unique_ptr<ActionToken>> R) {
     if (R.is_error()) {
       td::actor::send_closure(SelfId, &DownloadBlock::abort_query,
                               R.move_as_error_prefix("failed to get download token: "));
@@ -136,10 +140,10 @@ void DownloadBlock::got_block_handle(BlockHandle handle) {
                           std::move(P));
 }
 
-void DownloadBlock::got_download_token(std::unique_ptr<DownloadToken> token) {
+void DownloadBlock::got_download_token(std::unique_ptr<ActionToken> token) {
   token_ = std::move(token);
 
-  if (download_from_.is_zero() && !short_) {
+  if (download_from_.is_zero() && !short_ && client_.empty()) {
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
       if (R.is_error()) {
         td::actor::send_closure(SelfId, &DownloadBlock::abort_query, R.move_as_error());
@@ -179,10 +183,16 @@ void DownloadBlock::got_node_to_download(adnl::AdnlNodeIdShort node) {
     }
   });
 
-  td::actor::send_closure(overlays_, &overlay::Overlays::send_query, download_from_, local_id_, overlay_id_,
-                          "get_prepare", std::move(P), td::Timestamp::in(1.0),
-                          create_serialize_tl_object<ton_api::tonNode_prepareBlockProof>(create_tl_block_id(block_id_),
-                                                                                         allow_partial_proof_));
+  auto q = create_serialize_tl_object<ton_api::tonNode_prepareBlockProof>(create_tl_block_id(block_id_),
+                                                                          allow_partial_proof_);
+  if (client_.empty()) {
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_query, download_from_, local_id_, overlay_id_,
+                            "get_prepare", std::move(P), td::Timestamp::in(1.0), std::move(q));
+  } else {
+    td::actor::send_closure(client_, &adnl::AdnlExtClient::send_query, "get_prepare",
+                            create_serialize_tl_object_suffix<ton_api::tonNode_query>(std::move(q)),
+                            td::Timestamp::in(1.0), std::move(P));
+  }
 }
 
 void DownloadBlock::got_block_proof_description(td::BufferSlice proof_description) {
@@ -207,11 +217,16 @@ void DownloadBlock::got_block_proof_description(td::BufferSlice proof_descriptio
               }
             });
 
-            td::actor::send_closure(
-                overlays_, &overlay::Overlays::send_query_via, download_from_, local_id_, overlay_id_,
-                "download block proof", std::move(P), td::Timestamp::in(3.0),
-                create_serialize_tl_object<ton_api::tonNode_downloadBlockProof>(create_tl_block_id(block_id_)),
-                FullNode::max_proof_size(), rldp_);
+            auto q = create_serialize_tl_object<ton_api::tonNode_downloadBlockProof>(create_tl_block_id(block_id_));
+            if (client_.empty()) {
+              td::actor::send_closure(overlays_, &overlay::Overlays::send_query_via, download_from_, local_id_,
+                                      overlay_id_, "get_proof", std::move(P), td::Timestamp::in(3.0), std::move(q),
+                                      FullNode::max_proof_size(), rldp_);
+            } else {
+              td::actor::send_closure(client_, &adnl::AdnlExtClient::send_query, "get_proof",
+                                      create_serialize_tl_object_suffix<ton_api::tonNode_query>(std::move(q)),
+                                      td::Timestamp::in(3.0), std::move(P));
+            }
           },
           [&](ton_api::tonNode_preparedProofLink &obj) {
             if (!allow_partial_proof_) {
@@ -226,11 +241,16 @@ void DownloadBlock::got_block_proof_description(td::BufferSlice proof_descriptio
               }
             });
 
-            td::actor::send_closure(
-                overlays_, &overlay::Overlays::send_query_via, download_from_, local_id_, overlay_id_,
-                "download block proof link", std::move(P), td::Timestamp::in(3.0),
-                create_serialize_tl_object<ton_api::tonNode_downloadBlockProofLink>(create_tl_block_id(block_id_)),
-                FullNode::max_proof_size(), rldp_);
+            auto q = create_serialize_tl_object<ton_api::tonNode_downloadBlockProofLink>(create_tl_block_id(block_id_));
+            if (client_.empty()) {
+              td::actor::send_closure(overlays_, &overlay::Overlays::send_query_via, download_from_, local_id_,
+                                      overlay_id_, "get_proof_link", std::move(P), td::Timestamp::in(3.0), std::move(q),
+                                      FullNode::max_proof_size(), rldp_);
+            } else {
+              td::actor::send_closure(client_, &adnl::AdnlExtClient::send_query, "get_proof_link",
+                                      create_serialize_tl_object_suffix<ton_api::tonNode_query>(std::move(q)),
+                                      td::Timestamp::in(3.0), std::move(P));
+            }
           },
           [&](ton_api::tonNode_preparedProofEmpty &obj) {
             abort_query(td::Status::Error(ErrorCode::notready, "proof not found"));
@@ -317,9 +337,15 @@ void DownloadBlock::got_block_handle_2(BlockHandle handle) {
       }
     });
 
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_query, download_from_, local_id_, overlay_id_,
-                            "get_prepare", std::move(P), td::Timestamp::in(1.0),
-                            create_serialize_tl_object<ton_api::tonNode_prepareBlock>(create_tl_block_id(block_id_)));
+    auto q = create_serialize_tl_object<ton_api::tonNode_prepareBlock>(create_tl_block_id(block_id_));
+    if (client_.empty()) {
+      td::actor::send_closure(overlays_, &overlay::Overlays::send_query, download_from_, local_id_, overlay_id_,
+                              "get_prepare_block", std::move(P), td::Timestamp::in(1.0), std::move(q));
+    } else {
+      td::actor::send_closure(client_, &adnl::AdnlExtClient::send_query, "get_prepare_block",
+                              create_serialize_tl_object_suffix<ton_api::tonNode_query>(std::move(q)),
+                              td::Timestamp::in(1.0), std::move(P));
+    }
   }
 }
 
@@ -333,25 +359,31 @@ void DownloadBlock::got_block_data_description(td::BufferSlice data_description)
   auto f = F.move_as_ok();
 
   ton_api::downcast_call(
-      *f.get(), td::overloaded(
-                    [&, self = this](ton_api::tonNode_prepared &val) {
-                      auto P = td::PromiseCreator::lambda([SelfId = actor_id(self)](td::Result<td::BufferSlice> R) {
-                        if (R.is_error()) {
-                          td::actor::send_closure(SelfId, &DownloadBlock::abort_query, R.move_as_error());
-                        } else {
-                          td::actor::send_closure(SelfId, &DownloadBlock::got_block_data, R.move_as_ok());
-                        }
-                      });
+      *f.get(),
+      td::overloaded(
+          [&, self = this](ton_api::tonNode_prepared &val) {
+            auto P = td::PromiseCreator::lambda([SelfId = actor_id(self)](td::Result<td::BufferSlice> R) {
+              if (R.is_error()) {
+                td::actor::send_closure(SelfId, &DownloadBlock::abort_query, R.move_as_error());
+              } else {
+                td::actor::send_closure(SelfId, &DownloadBlock::got_block_data, R.move_as_ok());
+              }
+            });
 
-                      td::actor::send_closure(
-                          overlays_, &overlay::Overlays::send_query_via, download_from_, local_id_, overlay_id_,
-                          "download block", std::move(P), td::Timestamp::in(3.0),
-                          create_serialize_tl_object<ton_api::tonNode_downloadBlock>(create_tl_block_id(block_id_)),
-                          FullNode::max_block_size(), rldp_);
-                    },
-                    [&](ton_api::tonNode_notFound &val) {
-                      abort_query(td::Status::Error(ErrorCode::notready, "dst node does not have block"));
-                    }));
+            auto q = create_serialize_tl_object<ton_api::tonNode_downloadBlock>(create_tl_block_id(block_id_));
+            if (client_.empty()) {
+              td::actor::send_closure(overlays_, &overlay::Overlays::send_query_via, download_from_, local_id_,
+                                      overlay_id_, "get_block", std::move(P), td::Timestamp::in(15.0), std::move(q),
+                                      FullNode::max_block_size(), rldp_);
+            } else {
+              td::actor::send_closure(client_, &adnl::AdnlExtClient::send_query, "get_block",
+                                      create_serialize_tl_object_suffix<ton_api::tonNode_query>(std::move(q)),
+                                      td::Timestamp::in(15.0), std::move(P));
+            }
+          },
+          [&](ton_api::tonNode_notFound &val) {
+            abort_query(td::Status::Error(ErrorCode::notready, "dst node does not have block"));
+          }));
 }
 
 void DownloadBlock::got_block_data(td::BufferSlice data) {

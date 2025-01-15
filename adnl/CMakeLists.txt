@@ -1,6 +1,7 @@
-cmake_minimum_required(VERSION 3.0.2 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
 
 #BEGIN internal
+if (NOT TON_ONLY_TONLIB)
 set(ADNL_HEADERS
   adnl-address-list.h
   adnl-address-list.hpp
@@ -41,6 +42,7 @@ set(ADNL_SOURCE
   adnl-message.cpp
   adnl-network-manager.cpp
   adnl-node.cpp
+  adnl-node-id.cpp
   adnl-packet.cpp
   adnl-peer-table.cpp
   adnl-peer.cpp
@@ -66,6 +68,7 @@ set(ADNL_PROXY_SOURCE
 
 #FIXME
 set(ADNL_LITE_HEADERS ${ADNL_HEADERS})
+endif()
 #END internal
 
 set(ADNL_LITE_SOURCE
@@ -77,6 +80,7 @@ set(ADNL_LITE_SOURCE
 )
 
 #BEGIN internal
+if (NOT TON_ONLY_TONLIB)
 add_library(adnl STATIC ${ADNL_SOURCE})
 
 target_include_directories(adnl PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
@@ -84,15 +88,21 @@ target_link_libraries(adnl PUBLIC tdactor ton_crypto tl_api tdnet tddb keys keyr
 
 add_executable(adnl-proxy ${ADNL_PROXY_SOURCE})
 target_include_directories(adnl-proxy PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
-target_link_libraries(adnl-proxy PUBLIC tdactor ton_crypto tl_api tdnet common
-  tl-utils)
+target_link_libraries(adnl-proxy PUBLIC tdactor ton_crypto tl_api tdnet common tl-utils git)
+
+add_executable(adnl-pong adnl-pong.cpp)
+target_include_directories(adnl-pong PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
+target_link_libraries(adnl-pong PUBLIC tdactor ton_crypto tl_api tdnet common tl-utils adnl dht git)
 
 add_library(adnltest STATIC ${ADNL_TEST_SOURCE})
 target_include_directories(adnltest PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
-target_link_libraries(adnltest PUBLIC adnl )
+target_link_libraries(adnltest PUBLIC adnl)
+
+install(TARGETS adnl-proxy RUNTIME DESTINATION bin)
+endif()
 #END internal
 
 add_library(adnllite STATIC ${ADNL_LITE_SOURCE})
 
 target_include_directories(adnllite PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
-target_link_libraries(adnllite PUBLIC tdactor ton_crypto tl_lite_api tdnet keys )
+target_link_libraries(adnllite PUBLIC tdactor ton_crypto tl_lite_api tdnet keys)
