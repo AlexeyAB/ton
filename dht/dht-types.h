@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -89,7 +89,6 @@ class DhtKey {
   }
   DhtKey(PublicKeyHash id, DhtKeyName namestr, td::uint32 idx)
       : id_(std::move(id)), namestr_(std::move(namestr)), idx_(idx) {
-    CHECK(namestr.size() <= max_name_length());
   }
   static td::Result<DhtKey> create(tl_object_ptr<ton_api::dht_key> key);
   td::Status check() const;
@@ -120,6 +119,9 @@ class DhtUpdateRule {
   virtual td::Status check_value(const DhtValue &value) = 0;
   virtual td::Status update_value(DhtValue &value, DhtValue &&new_value) = 0;
   virtual bool need_republish() const = 0;
+  virtual bool check_is_acceptable(const DhtValue &value) {
+    return true;
+  }
   virtual tl_object_ptr<ton_api::dht_UpdateRule> tl() const = 0;
   static td::Result<std::shared_ptr<DhtUpdateRule>> create(tl_object_ptr<ton_api::dht_UpdateRule> obj);
 };
@@ -211,6 +213,7 @@ class DhtValue {
   void update_signature(td::BufferSlice signature);
   void update_signature(td::SharedSlice signature);
   td::Status check() const;
+  bool check_is_acceptable() const;
 
   DhtKeyId key_id() const;
 
@@ -250,6 +253,7 @@ class DhtUpdateRuleOverlayNodes : public DhtUpdateRule {
   bool need_republish() const override {
     return false;
   }
+  bool check_is_acceptable(const DhtValue &value) override;
   tl_object_ptr<ton_api::dht_UpdateRule> tl() const override;
   static td::Result<std::shared_ptr<DhtUpdateRule>> create();
 };

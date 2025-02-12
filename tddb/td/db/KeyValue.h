@@ -14,11 +14,13 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "td/utils/Status.h"
+#include "td/utils/Time.h"
 #include "td/utils/logging.h"
+#include <functional>
 namespace td {
 class KeyValueReader {
  public:
@@ -27,6 +29,12 @@ class KeyValueReader {
 
   virtual Result<GetStatus> get(Slice key, std::string &value) = 0;
   virtual Result<size_t> count(Slice prefix) = 0;
+  virtual Status for_each(std::function<Status(Slice, Slice)> f) {
+    return Status::Error("for_each is not supported");
+  }
+  virtual Status for_each_in_range (Slice begin, Slice end, std::function<Status(Slice, Slice)> f) {
+    return td::Status::Error("foreach_range is not supported");
+  }
 };
 
 class PrefixedKeyValueReader : public KeyValueReader {
@@ -54,6 +62,10 @@ class KeyValue : public KeyValueReader {
  public:
   virtual Status set(Slice key, Slice value) = 0;
   virtual Status erase(Slice key) = 0;
+
+  virtual Status begin_write_batch() = 0;
+  virtual Status commit_write_batch() = 0;
+  virtual Status abort_write_batch() = 0;
 
   virtual Status begin_transaction() = 0;
   virtual Status commit_transaction() = 0;
@@ -84,6 +96,16 @@ class PrefixedKeyValue : public KeyValue {
   }
   Status erase(Slice key) override {
     return kv_->erase(PSLICE() << prefix_ << key);
+  }
+
+  Status begin_write_batch() override {
+    return kv_->begin_write_batch();
+  }
+  Status commit_write_batch() override {
+    return kv_->commit_write_batch();
+  }
+  Status abort_write_batch() override {
+    return kv_->abort_write_batch();
   }
 
   Status begin_transaction() override {

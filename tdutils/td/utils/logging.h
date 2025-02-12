@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -40,6 +40,7 @@
 #include "td/utils/Slice.h"
 #include "td/utils/StackAllocator.h"
 #include "td/utils/StringBuilder.h"
+#include "td/utils/port/Clocks.h"
 
 #include <atomic>
 #include <type_traits>
@@ -52,8 +53,8 @@
 
 #define VERBOSITY_NAME(x) verbosity_##x
 
-#define GET_VERBOSITY_LEVEL() (::td::log_options.level)
-#define SET_VERBOSITY_LEVEL(new_level) (::td::log_options.level = (new_level))
+#define GET_VERBOSITY_LEVEL() (::td::get_verbosity_level())
+#define SET_VERBOSITY_LEVEL(new_level) (::td::set_verbosity_level(new_level))
 
 #ifndef STRIP_LOG
 #define STRIP_LOG VERBOSITY_NAME(DEBUG)
@@ -64,7 +65,7 @@
 #define LOGGER(interface, options, level, comment) ::td::Logger(interface, options, level, __FILE__, __LINE__, comment)
 
 #define LOG_IMPL_FULL(interface, options, strip_level, runtime_level, condition, comment) \
-  LOG_IS_STRIPPED(strip_level) || runtime_level > options.level || !(condition)           \
+  LOG_IS_STRIPPED(strip_level) || runtime_level > options.get_level() || !(condition)     \
       ? (void)0                                                                           \
       : ::td::detail::Voidify() & LOGGER(interface, options, runtime_level, comment)
 
@@ -73,6 +74,7 @@
 
 #define LOG(level) LOG_IMPL(level, level, true, ::td::Slice())
 #define LOG_IF(level, condition) LOG_IMPL(level, level, condition, #condition)
+#define FLOG(level) LOG_IMPL(level, level, true, ::td::Slice()) << td::LambdaPrint{} << [&](auto &sb)
 
 #define VLOG(level) LOG_IMPL(DEBUG, level, true, TD_DEFINE_STR(level))
 #define VLOG_IF(level, condition) LOG_IMPL(DEBUG, level, condition, TD_DEFINE_STR(level) " " #condition)
@@ -94,13 +96,13 @@ inline bool no_return_func() {
 #define DUMMY_LOG_CHECK(condition) LOG_IF(NEVER, !(condition))
 
 #ifdef TD_DEBUG
-  #if TD_MSVC
+#if TD_MSVC
     #define LOG_CHECK(condition)        \
       __analysis_assume(!!(condition)); \
       LOG_IMPL(FATAL, FATAL, !(condition), #condition)
-  #else
+#else
     #define LOG_CHECK(condition) LOG_IMPL(FATAL, FATAL, !(condition) && no_return_func(), #condition)
-  #endif
+#endif
 #else
   #define LOG_CHECK DUMMY_LOG_CHECK
 #endif
@@ -133,11 +135,18 @@ extern int VERBOSITY_NAME(files);
 extern int VERBOSITY_NAME(sqlite);
 
 struct LogOptions {
-  int level{VERBOSITY_NAME(DEBUG) + 1};
+  std::atomic<int> level{VERBOSITY_NAME(DEBUG) + 1};
   bool fix_newlines{true};
   bool add_info{true};
 
-  static constexpr LogOptions plain() {
+  int get_level() const {
+    return level.load(std::memory_order_relaxed);
+  }
+  int set_level(int new_level) {
+    return level.exchange(new_level);
+  }
+
+  static LogOptions plain() {
     return LogOptions{0, false, false};
   }
 
@@ -145,9 +154,31 @@ struct LogOptions {
   constexpr LogOptions(int level, bool fix_newlines, bool add_info)
       : level(level), fix_newlines(fix_newlines), add_info(add_info) {
   }
+
+  LogOptions(const LogOptions &other) : LogOptions(other.level.load(), other.fix_newlines, other.add_info) {
+  }
+
+  LogOptions &operator=(const LogOptions &other) {
+    level = other.level.load();
+    fix_newlines = other.fix_newlines;
+    add_info = other.add_info;
+    return *this;
+  }
 };
 
 extern LogOptions log_options;
+inline int set_verbosity_level(int level) {
+  return log_options.set_level(level);
+}
+inline int get_verbosity_level() {
+  return log_options.get_level();
+}
+
+class ScopedDisableLog {
+ public:
+  ScopedDisableLog();
+  ~ScopedDisableLog();
+};
 
 class LogInterface {
  public:
@@ -222,7 +253,8 @@ class Logger {
       , log_(log)
       , sb_(buffer_.as_slice())
       , options_(options)
-      , log_level_(log_level) {
+      , log_level_(log_level)
+      , start_at_(Clocks::rdtsc()) {
   }
 
   Logger(LogInterface &log, const LogOptions &options, int log_level, Slice file_name, int line_num, Slice comment);
@@ -231,6 +263,9 @@ class Logger {
   Logger &operator<<(const T &other) {
     sb_ << other;
     return *this;
+  }
+  LambdaPrintHelper<td::Logger> operator<<(const LambdaPrint &) {
+    return LambdaPrintHelper<td::Logger>{*this};
   }
 
   MutableCSlice as_cslice() {
@@ -254,6 +289,7 @@ class Logger {
   StringBuilder sb_;
   const LogOptions &options_;
   int log_level_;
+  td::uint64 start_at_;
 };
 
 namespace detail {
@@ -307,7 +343,10 @@ class TsLog : public LogInterface {
 
  private:
   LogInterface *log_ = nullptr;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-pragma"
   std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+#pragma clang diagnostic pop
   void enter_critical() {
     while (lock_.test_and_set(std::memory_order_acquire)) {
       // spin
@@ -317,5 +356,4 @@ class TsLog : public LogInterface {
     lock_.clear(std::memory_order_release);
   }
 };
-
 }  // namespace td

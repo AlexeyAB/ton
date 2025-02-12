@@ -14,9 +14,10 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "func.h"
+#include "vm/boc.h"
 
 namespace funC {
 
@@ -29,6 +30,7 @@ namespace funC {
 void CodeBlob::simplify_var_types() {
   for (TmpVar& var : vars) {
     TypeExpr::remove_indirect(var.v_type);
+    var.v_type->recompute_width();
   }
 }
 
@@ -41,14 +43,14 @@ int CodeBlob::split_vars(bool strict) {
     }
     std::vector<TypeExpr*> comp_types;
     int k = var.v_type->extract_components(comp_types);
-    assert(k <= 254 && n <= 0x7fff00);
-    assert((unsigned)k == comp_types.size());
+    func_assert(k <= 254 && n <= 0x7fff00);
+    func_assert((unsigned)k == comp_types.size());
     if (k != 1) {
       var.coord = ~((n << 8) + k);
       for (int i = 0; i < k; i++) {
         auto v = create_var(vars[j].cls, comp_types[i], 0, vars[j].where.get());
-        assert(v == n + i);
-        assert(vars[v].idx == v);
+        func_assert(v == n + i);
+        func_assert(vars[v].idx == v);
         vars[v].name = vars[j].name;
         vars[v].coord = ((int)j << 8) + i + 1;
       }
@@ -74,12 +76,12 @@ bool CodeBlob::compute_used_code_vars() {
 }
 
 bool CodeBlob::compute_used_code_vars(std::unique_ptr<Op>& ops_ptr, const VarDescrList& var_info, bool edit) const {
-  assert(ops_ptr);
+  func_assert(ops_ptr);
   if (!ops_ptr->next) {
-    assert(ops_ptr->cl == Op::_Nop);
+    func_assert(ops_ptr->cl == Op::_Nop);
     return ops_ptr->set_var_info(var_info);
   }
-  return compute_used_code_vars(ops_ptr->next, var_info, edit) | ops_ptr->compute_used_vars(*this, edit);
+  return int(compute_used_code_vars(ops_ptr->next, var_info, edit)) | int(ops_ptr->compute_used_vars(*this, edit));
 }
 
 bool operator==(const VarDescrList& x, const VarDescrList& y) {
@@ -138,7 +140,7 @@ bool Op::set_var_info_except(const VarDescrList& new_var_info, const std::vector
   }
   VarDescrList tmp_info{new_var_info};
   tmp_info -= var_list;
-  return set_var_info(new_var_info);
+  return set_var_info(tmp_info);
 }
 
 bool Op::set_var_info_except(VarDescrList&& new_var_info, const std::vector<var_idx_t>& var_list) {
@@ -272,6 +274,12 @@ VarDescrList& VarDescrList::operator+=(const VarDescrList& y) {
 }
 
 VarDescrList VarDescrList::operator|(const VarDescrList& y) const {
+  if (y.unreachable) {
+    return *this;
+  }
+  if (unreachable) {
+    return y;
+  }
   VarDescrList res;
   auto it1 = list.cbegin();
   auto it2 = y.list.cbegin();
@@ -289,7 +297,11 @@ VarDescrList VarDescrList::operator|(const VarDescrList& y) const {
 }
 
 VarDescrList& VarDescrList::operator|=(const VarDescrList& y) {
-  return *this = *this | y;
+  if (y.unreachable) {
+    return *this;
+  } else {
+    return *this = *this | y;
+  }
 }
 
 VarDescrList& VarDescrList::operator&=(const VarDescrList& values) {
@@ -299,16 +311,22 @@ VarDescrList& VarDescrList::operator&=(const VarDescrList& values) {
       *item &= vd;
     }
   }
+  unreachable |= values.unreachable;
   return *this;
 }
 
 VarDescrList& VarDescrList::import_values(const VarDescrList& values) {
-  for (const VarDescr& vd : values.list) {
-    VarDescr* item = operator[](vd.idx);
-    if (item) {
-      item->set_value(vd);
+  if (values.unreachable) {
+    set_unreachable();
+  } else
+    for (auto& vd : list) {
+      auto new_vd = values[vd.idx];
+      if (new_vd) {
+        vd.set_value(*new_vd);
+      } else {
+        vd.clear_value();
+      }
     }
-  }
   return *this;
 }
 
@@ -329,16 +347,19 @@ bool Op::std_compute_used_vars(bool disabled) {
 }
 
 bool Op::compute_used_vars(const CodeBlob& code, bool edit) {
-  assert(next);
+  func_assert(next);
   const VarDescrList& next_var_info = next->var_info;
   if (cl == _Nop) {
     return set_var_info_except(next_var_info, left);
   }
   switch (cl) {
     case _IntConst:
+    case _SliceConst:
     case _GlobVar:
     case _Call:
-    case _CallInd: {
+    case _CallInd:
+    case _Tuple:
+    case _UnTuple: {
       // left = EXEC right;
       if (!next_var_info.count_used(left) && is_pure()) {
         // all variables in `left` are not needed
@@ -349,10 +370,17 @@ bool Op::compute_used_vars(const CodeBlob& code, bool edit) {
       }
       return std_compute_used_vars();
     }
+    case _SetGlob: {
+      // GLOB = right
+      if (right.empty() && edit) {
+        disable();
+      }
+      return std_compute_used_vars(right.empty());
+    }
     case _Let: {
       // left = right
       std::size_t cnt = next_var_info.count_used(left);
-      assert(left.size() == right.size());
+      func_assert(left.size() == right.size());
       auto l_it = left.cbegin(), r_it = right.cbegin();
       VarDescrList new_var_info{next_var_info};
       new_var_info -= left;
@@ -361,7 +389,7 @@ bool Op::compute_used_vars(const CodeBlob& code, bool edit) {
       for (; l_it < left.cend(); ++l_it, ++r_it) {
         if (std::find(l_it + 1, left.cend(), *l_it) == left.cend()) {
           auto p = next_var_info[*l_it];
-          new_var_info.add_var(*r_it, !p || p->is_unused());
+          new_var_info.add_var(*r_it, edit && (!p || p->is_unused()));
           new_left.push_back(*l_it);
           new_right.push_back(*r_it);
         }
@@ -415,26 +443,25 @@ bool Op::compute_used_vars(const CodeBlob& code, bool edit) {
     }
     case _While: {
       // while (block0 || left) block1;
-      // ... { block0 left block1 } block0 left next
-      VarDescrList after_cond_first{next_var_info};
-      after_cond_first += left;
-      code.compute_used_code_vars(block0, after_cond_first, false);
-      VarDescrList new_var_info{block0->var_info};
+      // ... block0 left { block1 block0 left } next
+      VarDescrList new_var_info{next_var_info};
       bool changes = false;
       do {
-        code.compute_used_code_vars(block1, block0->var_info, changes);
-        VarDescrList after_cond{block1->var_info};
+        VarDescrList after_cond{new_var_info};
         after_cond += left;
         code.compute_used_code_vars(block0, after_cond, changes);
+        code.compute_used_code_vars(block1, block0->var_info, changes);
         std::size_t n = new_var_info.size();
-        new_var_info += block0->var_info;
+        new_var_info += block1->var_info;
         new_var_info.clear_last();
         if (changes) {
           break;
         }
         changes = (new_var_info.size() == n);
       } while (changes <= edit);
-      return set_var_info(std::move(new_var_info));
+      new_var_info += left;
+      code.compute_used_code_vars(block0, new_var_info, edit);
+      return set_var_info(block0->var_info);
     }
     case _Until: {
       // until (block0 || left);
@@ -474,7 +501,12 @@ bool Op::compute_used_vars(const CodeBlob& code, bool edit) {
         }
         changes = (new_var_info.size() == n);
       } while (changes <= edit);
+      func_assert(left.size() == 1);
+      bool last = new_var_info.count_used(left) == 0;
       new_var_info += left;
+      if (last) {
+        new_var_info[left[0]]->flags |= VarDescr::_Last;
+      }
       return set_var_info(std::move(new_var_info));
     }
     case _Again: {
@@ -493,6 +525,14 @@ bool Op::compute_used_vars(const CodeBlob& code, bool edit) {
         changes = (new_var_info.size() == n);
       } while (changes <= edit);
       return set_var_info(std::move(new_var_info));
+    }
+    case _TryCatch: {
+      code.compute_used_code_vars(block0, next_var_info, edit);
+      code.compute_used_code_vars(block1, next_var_info, edit);
+      VarDescrList merge_info = block0->var_info + block1->var_info + next_var_info;
+      merge_info -= left;
+      merge_info.clear_last();
+      return set_var_info(std::move(merge_info));
     }
     default:
       std::cerr << "fatal: unknown operation <??" << cl << "> in compute_used_vars()\n";
@@ -515,9 +555,13 @@ bool prune_unreachable(std::unique_ptr<Op>& ops) {
   bool reach;
   switch (op.cl) {
     case Op::_IntConst:
+    case Op::_SliceConst:
     case Op::_GlobVar:
+    case Op::_SetGlob:
     case Op::_Call:
     case Op::_CallInd:
+    case Op::_Tuple:
+    case Op::_UnTuple:
     case Op::_Import:
       reach = true;
       break;
@@ -540,7 +584,7 @@ bool prune_unreachable(std::unique_ptr<Op>& ops) {
         ops = std::move(op.block1);
         return prune_unreachable(ops);
       } else {
-        reach = prune_unreachable(op.block0) | prune_unreachable(op.block1);
+        reach = int(prune_unreachable(op.block0)) | int(prune_unreachable(op.block1));
       }
       break;
     }
@@ -556,7 +600,7 @@ bool prune_unreachable(std::unique_ptr<Op>& ops) {
         // block1 never executed
         op.block0->last().next = std::move(op.next);
         ops = std::move(op.block0);
-        return false;
+        return prune_unreachable(ops);
       } else if (c_var && c_var->always_true()) {
         if (!prune_unreachable(op.block1)) {
           // block1 never returns
@@ -612,7 +656,11 @@ bool prune_unreachable(std::unique_ptr<Op>& ops) {
         ops = std::move(op.block0);
         return false;
       }
-      reach = true;
+      reach = (op.cl != Op::_Again);
+      break;
+    }
+    case Op::_TryCatch: {
+      reach = int(prune_unreachable(op.block0)) | int(prune_unreachable(op.block1));
       break;
     }
     default:
@@ -637,7 +685,7 @@ void CodeBlob::prune_unreachable_code() {
 
 void CodeBlob::fwd_analyze() {
   VarDescrList values;
-  assert(ops && ops->cl == Op::_Import);
+  func_assert(ops && ops->cl == Op::_Import);
   for (var_idx_t i : ops->left) {
     values += i;
     if (vars[i].v_type->is_int()) {
@@ -658,8 +706,11 @@ void Op::prepare_args(VarDescrList values) {
     const VarDescr* val = values[right[i]];
     if (val) {
       args[i].set_value(*val);
-      args[i].clear_unused();
+      // args[i].clear_unused();
+    } else {
+      args[i].clear_value();
     }
+    args[i].clear_unused();
   }
 }
 
@@ -670,13 +721,16 @@ VarDescrList Op::fwd_analyze(VarDescrList values) {
     case _Import:
       break;
     case _Return:
-      values.list.clear();
+      values.set_unreachable();
       break;
     case _IntConst: {
       values.add_newval(left[0]).set_const(int_const);
       break;
     }
-    case _GlobVar:
+    case _SliceConst: {
+      values.add_newval(left[0]).set_const(str_const);
+      break;
+    }
     case _Call: {
       prepare_args(values);
       auto func = dynamic_cast<const SymValAsmFunc*>(fun_ref->value);
@@ -687,7 +741,7 @@ VarDescrList Op::fwd_analyze(VarDescrList values) {
           res.emplace_back(i);
         }
         AsmOpList tmp;
-        func->compile(tmp, res, args);  // abstract interpretation of res := f (args)
+        func->compile(tmp, res, args, where);  // abstract interpretation of res := f (args)
         int j = 0;
         for (var_idx_t i : left) {
           values.add_newval(i).set_value(res[j++]);
@@ -699,15 +753,20 @@ VarDescrList Op::fwd_analyze(VarDescrList values) {
       }
       break;
     }
+    case _Tuple:
+    case _UnTuple:
+    case _GlobVar:
     case _CallInd: {
       for (var_idx_t i : left) {
         values.add_newval(i);
       }
       break;
     }
+    case _SetGlob:
+      break;
     case _Let: {
       std::vector<VarDescr> old_val;
-      assert(left.size() == right.size());
+      func_assert(left.size() == right.size());
       for (std::size_t i = 0; i < right.size(); i++) {
         const VarDescr* ov = values[right[i]];
         if (!ov && verbosity >= 5) {
@@ -722,7 +781,7 @@ VarDescrList Op::fwd_analyze(VarDescrList values) {
           }
           std::cerr << std::endl;
         }
-        // assert(ov);
+        // func_assert(ov);
         if (ov) {
           old_val.push_back(*ov);
         } else {
@@ -757,6 +816,7 @@ VarDescrList Op::fwd_analyze(VarDescrList values) {
       break;
     }
     case _While: {
+      auto values0 = values;
       values = block0->fwd_analyze(values);
       if (values[left[0]] && values[left[0]]->always_false()) {
         // block1 never executed
@@ -764,7 +824,7 @@ VarDescrList Op::fwd_analyze(VarDescrList values) {
         break;
       }
       while (true) {
-        VarDescrList next_values = values | block0->fwd_analyze(block1->fwd_analyze(values));
+        VarDescrList next_values = values | block0->fwd_analyze(values0 | block1->fwd_analyze(values));
         if (same_values(next_values, values)) {
           break;
         }
@@ -782,6 +842,12 @@ VarDescrList Op::fwd_analyze(VarDescrList values) {
         values = std::move(next_values);
       }
       values = block0->fwd_analyze(values);
+      break;
+    }
+    case _TryCatch: {
+      VarDescrList val1 = block0->fwd_analyze(values);
+      VarDescrList val2 = block1->fwd_analyze(std::move(values));
+      values = val1 | val2;
       break;
     }
     default:
@@ -813,7 +879,11 @@ bool Op::mark_noreturn() {
       // fallthrough
     case _Import:
     case _IntConst:
+    case _SliceConst:
     case _Let:
+    case _Tuple:
+    case _UnTuple:
+    case _SetGlob:
     case _GlobVar:
     case _CallInd:
     case _Call:
@@ -821,15 +891,16 @@ bool Op::mark_noreturn() {
     case _Return:
       return set_noreturn(true);
     case _If:
-      return set_noreturn((block0->mark_noreturn() & (block1 && block1->mark_noreturn())) | next->mark_noreturn());
+    case _TryCatch:
+      return set_noreturn((int(block0->mark_noreturn()) & int(block1 && block1->mark_noreturn())) | int(next->mark_noreturn()));
     case _Again:
       block0->mark_noreturn();
-      return set_noreturn(false);
+      return set_noreturn(true);
     case _Until:
-      return set_noreturn(block0->mark_noreturn() | next->mark_noreturn());
+      return set_noreturn(int(block0->mark_noreturn()) | int(next->mark_noreturn()));
     case _While:
       block1->mark_noreturn();
-      return set_noreturn(block0->mark_noreturn() | next->mark_noreturn());
+      return set_noreturn(int(block0->mark_noreturn()) | int(next->mark_noreturn()));
     case _Repeat:
       block0->mark_noreturn();
       return set_noreturn(next->mark_noreturn());

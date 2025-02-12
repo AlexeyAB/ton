@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -63,7 +63,10 @@ class SpinLock {
   }
 
  private:
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-pragma"
   std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+#pragma clang diagnostic pop
   void unlock() {
     flag_.clear(std::memory_order_release);
   }

@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "tl_writer.h"
 
@@ -28,7 +28,7 @@ namespace tl {
 
 std::string TL_writer::int_to_string(int x) {
   char buf[15];
-  std::sprintf(buf, "%d", x);
+  std::snprintf(buf, sizeof(buf), "%d", x);
   return buf;
 }
 

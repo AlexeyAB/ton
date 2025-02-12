@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -125,6 +125,14 @@ struct Auto {
   operator ToT() const {
     return ToT();
   }
+};
+
+struct NoCopyOrMove {
+  NoCopyOrMove() = default;
+  NoCopyOrMove(NoCopyOrMove &&) = delete;
+  NoCopyOrMove(const NoCopyOrMove &) = delete;
+  NoCopyOrMove &operator=(NoCopyOrMove &&) = delete;
+  NoCopyOrMove &operator=(const NoCopyOrMove &) = delete;
 };
 
 }  // namespace td

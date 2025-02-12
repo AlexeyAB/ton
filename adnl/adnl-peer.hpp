@@ -14,12 +14,13 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
 #include <vector>
 #include <map>
+#include <queue>
 
 #include "adnl-peer.h"
 #include "adnl-peer-table.h"
@@ -58,23 +59,24 @@ class AdnlPeerPairImpl : public AdnlPeerPair {
   }
 
   AdnlPeerPairImpl(td::actor::ActorId<AdnlNetworkManager> network_manager, td::actor::ActorId<AdnlPeerTable> peer_table,
-                   td::actor::ActorId<AdnlLocalId> local_actor, td::actor::ActorId<AdnlPeer> peer,
-                   td::actor::ActorId<dht::Dht> dht_node, AdnlNodeIdShort local_id, AdnlNodeIdShort peer_id);
+                   td::uint32 local_mode, td::actor::ActorId<AdnlLocalId> local_actor,
+                   td::actor::ActorId<AdnlPeer> peer, td::actor::ActorId<dht::Dht> dht_node, AdnlNodeIdShort local_id,
+                   AdnlNodeIdShort peer_id);
   void start_up() override;
   void alarm() override;
 
   void discover();
 
-  void receive_packet_from_channel(AdnlChannelIdShort id, AdnlPacket packet) override;
+  void receive_packet_from_channel(AdnlChannelIdShort id, AdnlPacket packet, td::uint64 serialized_size) override;
   void receive_packet_checked(AdnlPacket packet) override;
-  void receive_packet(AdnlPacket packet) override;
+  void receive_packet(AdnlPacket packet, td::uint64 serialized_size) override;
   void deliver_message(AdnlMessage message);
 
-  void send_messages_in(std::vector<AdnlMessage> messages, bool allow_postpone);
-  void send_messages(std::vector<AdnlMessage> messages) override;
+  void send_messages_from_queue();
+  void send_messages(std::vector<OutboundAdnlMessage> messages) override;
   void send_packet_continue(AdnlPacket packet, td::actor::ActorId<AdnlNetworkConnection> conn, bool via_channel);
-  void send_query(std::string name, td::Promise<td::BufferSlice> promise, td::Timestamp timeout,
-                  td::BufferSlice data) override;
+  void send_query(std::string name, td::Promise<td::BufferSlice> promise, td::Timestamp timeout, td::BufferSlice data,
+                  td::uint32 flags) override;
 
   void alarm_query(AdnlQueryId id) override;
 
@@ -86,6 +88,9 @@ class AdnlPeerPairImpl : public AdnlPeerPair {
 
   void update_addr_list(AdnlAddressList addr_list) override;
   void update_peer_id(AdnlNodeIdFull id) override;
+
+  void get_conn_ip_str(td::Promise<td::string> promise) override;
+  void get_stats(bool all, td::Promise<tl_object_ptr<ton_api::adnl_stats_peerPair>> promise) override;
 
   void got_data_from_db(td::Result<AdnlDbItem> R);
   void got_data_from_static_nodes(td::Result<AdnlNode> R);
@@ -119,11 +124,12 @@ class AdnlPeerPairImpl : public AdnlPeerPair {
   }
 
  private:
+  void respond_with_nop();
   void reinit(td::int32 date);
-  td::Result<td::actor::ActorId<AdnlNetworkConnection>> get_conn();
+  td::Result<std::pair<td::actor::ActorId<AdnlNetworkConnection>, bool>> get_conn();
   void create_channel(pubkeys::Ed25519 pub, td::uint32 date);
 
-  bool received_packet(td::uint32 seqno) const {
+  bool received_packet(td::uint64 seqno) const {
     CHECK(seqno > 0);
     if (seqno + 64 <= in_seqno_) {
       return true;
@@ -134,7 +140,7 @@ class AdnlPeerPairImpl : public AdnlPeerPair {
     return recv_seqno_mask_ & (1ull << (in_seqno_ - seqno));
   }
 
-  void add_received_packet(td::uint32 seqno) {
+  void add_received_packet(td::uint64 seqno) {
     CHECK(!received_packet(seqno));
     if (seqno <= in_seqno_) {
       recv_seqno_mask_ |= (1ull << (in_seqno_ - seqno));
@@ -149,6 +155,9 @@ class AdnlPeerPairImpl : public AdnlPeerPair {
       }
     }
   }
+
+  void request_reverse_ping();
+  void request_reverse_ping_result(td::Result<td::Unit> R);
 
   struct Conn {
     class ConnCallback : public AdnlNetworkConnection::Callback {
@@ -169,21 +178,33 @@ class AdnlPeerPairImpl : public AdnlPeerPair {
     td::actor::ActorOwn<AdnlNetworkConnection> conn;
 
     Conn(AdnlAddress addr, td::actor::ActorId<AdnlPeerPairImpl> peer,
-         td::actor::ActorId<AdnlNetworkManager> network_manager)
+         td::actor::ActorId<AdnlNetworkManager> network_manager, td::actor::ActorId<Adnl> adnl)
         : addr(std::move(addr)) {
-      create_conn(peer, network_manager);
+      create_conn(peer, network_manager, adnl);
     }
     Conn() {
     }
 
-    bool ready() {
+    bool ready() const {
       return !conn.empty() && conn.get_actor_unsafe().is_active();
     }
 
-    void create_conn(td::actor::ActorId<AdnlPeerPairImpl> peer, td::actor::ActorId<AdnlNetworkManager> network_manager);
+    bool is_direct() const {
+      return addr->is_public();
+    }
+
+    void create_conn(td::actor::ActorId<AdnlPeerPairImpl> peer, td::actor::ActorId<AdnlNetworkManager> network_manager,
+                     td::actor::ActorId<Adnl> adnl);
   };
 
-  std::vector<AdnlMessage> pending_messages_;
+  // Messages waiting for connection or for nochannel rate limiter
+  std::queue<std::pair<OutboundAdnlMessage, td::Timestamp>> out_messages_queue_;
+  td::uint64 out_messages_queue_total_size_ = 0;
+  RateLimiter nochannel_rate_limiter_ = RateLimiter(50, 0.5);  // max 50, period = 0.5s
+  td::Timestamp retry_send_at_ = td::Timestamp::never();
+  bool disable_dht_query_ = false;
+  bool skip_init_packet_ = false;
+  double message_in_queue_ttl_ = 10.0;
 
   td::actor::ActorId<AdnlNetworkManager> network_manager_;
   td::actor::ActorId<AdnlPeerTable> peer_table_;
@@ -203,6 +224,7 @@ class AdnlPeerPairImpl : public AdnlPeerPair {
   pubkeys::Ed25519 channel_pub_;
   td::int32 channel_pk_date_;
   td::actor::ActorOwn<AdnlChannel> channel_;
+  td::Timestamp respond_with_nop_after_;
 
   td::uint64 in_seqno_ = 0;
   td::uint64 out_seqno_ = 0;
@@ -232,6 +254,8 @@ class AdnlPeerPairImpl : public AdnlPeerPair {
 
   std::map<AdnlQueryId, td::actor::ActorId<AdnlQuery>> out_queries_;
 
+  td::uint32 mode_;
+
   td::uint32 received_messages_ = 0;
   bool received_from_db_ = false;
   bool received_from_static_nodes_ = false;
@@ -239,22 +263,47 @@ class AdnlPeerPairImpl : public AdnlPeerPair {
 
   td::Timestamp next_dht_query_at_ = td::Timestamp::never();
   td::Timestamp next_db_update_at_ = td::Timestamp::never();
-  td::Timestamp retry_send_at_ = td::Timestamp::never();
+
+  td::Timestamp last_received_packet_ = td::Timestamp::never();
+  td::Timestamp try_reinit_at_ = td::Timestamp::never();
+  td::Timestamp drop_addr_list_at_ = td::Timestamp::never();
+
+  bool has_reverse_addr_ = false;
+  td::Timestamp request_reverse_ping_after_ = td::Timestamp::now();
+  bool request_reverse_ping_active_ = false;
+
+  struct PacketStats {
+    double ts_start = 0.0, ts_end = 0.0;
+    td::uint64 in_packets = 0, in_bytes = 0, in_packets_channel = 0, in_bytes_channel = 0;
+    td::uint64 out_packets = 0, out_bytes = 0, out_packets_channel = 0, out_bytes_channel = 0;
+    td::uint64 out_expired_messages = 0, out_expired_bytes = 0;
+
+    tl_object_ptr<ton_api::adnl_stats_packets> tl() const;
+  } packet_stats_cur_, packet_stats_prev_, packet_stats_total_;
+  double last_in_packet_ts_ = 0.0, last_out_packet_ts_ = 0.0;
+  double started_ts_ = td::Clocks::system();
+  void add_packet_stats(td::uint64 bytes, bool in, bool channel);
+  void add_expired_msg_stats(td::uint64 bytes);
+  void prepare_packet_stats();
 };
 
 class AdnlPeerImpl : public AdnlPeer {
  public:
-  void receive_packet(AdnlNodeIdShort dst, td::actor::ActorId<AdnlLocalId> dst_actor, AdnlPacket packet) override;
-  void send_messages(AdnlNodeIdShort src, td::actor::ActorId<AdnlLocalId> src_actor,
-                     std::vector<AdnlMessage> messages) override;
-  void send_query(AdnlNodeIdShort src, td::actor::ActorId<AdnlLocalId> src_actor, std::string name,
-                  td::Promise<td::BufferSlice> promise, td::Timestamp timeout, td::BufferSlice data) override;
+  void receive_packet(AdnlNodeIdShort dst, td::uint32 dst_mode, td::actor::ActorId<AdnlLocalId> dst_actor,
+                      AdnlPacket packet, td::uint64 serialized_size) override;
+  void send_messages(AdnlNodeIdShort src, td::uint32 src_mode, td::actor::ActorId<AdnlLocalId> src_actor,
+                     std::vector<OutboundAdnlMessage> messages) override;
+  void send_query(AdnlNodeIdShort src, td::uint32 src_mode, td::actor::ActorId<AdnlLocalId> src_actor, std::string name,
+                  td::Promise<td::BufferSlice> promise, td::Timestamp timeout, td::BufferSlice data,
+                  td::uint32 flags) override;
 
   void del_local_id(AdnlNodeIdShort local_id) override;
   void update_id(AdnlNodeIdFull id) override;
-  void update_addr_list(AdnlNodeIdShort local_id, td::actor::ActorId<AdnlLocalId> local_actor,
+  void update_addr_list(AdnlNodeIdShort local_id, td::uint32 local_mode, td::actor::ActorId<AdnlLocalId> local_actor,
                         AdnlAddressList addr_list) override;
   void update_dht_node(td::actor::ActorId<dht::Dht> dht_node) override;
+  void get_conn_ip_str(AdnlNodeIdShort l_id, td::Promise<td::string> promise) override;
+  void get_stats(bool all, td::Promise<std::vector<tl_object_ptr<ton_api::adnl_stats_peerPair>>> promise) override;
   //void check_signature(td::BufferSlice data, td::BufferSlice signature, td::Promise<td::Unit> promise) override;
 
   AdnlPeerImpl(td::actor::ActorId<AdnlNetworkManager> network_manager, td::actor::ActorId<AdnlPeerTable> peer_table,

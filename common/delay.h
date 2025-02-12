@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -48,5 +48,30 @@ class DelayedAction : public td::actor::Actor {
 template <typename T>
 void delay_action(T promise, td::Timestamp timeout) {
   DelayedAction<T>::create(std::move(promise), timeout);
+}
+
+template <typename PromiseT, typename ValueT>
+class AsyncApply : public td::actor::Actor {
+ public:
+  AsyncApply(PromiseT promise, ValueT value) : promise_(std::move(promise)), value_(std::move(value)){
+  }
+
+  void start_up() override {
+    promise_(std::move(value_));
+    stop();
+  }
+
+  static void create(td::Slice name, PromiseT promise, ValueT value ) {
+    td::actor::create_actor<AsyncApply>(PSLICE() << "async:" << name, std::move(promise), std::move(value)).release();
+  }
+
+ private:
+  PromiseT promise_;
+  ValueT value_;
+};
+
+template <class PromiseT, class ValueT>
+void async_apply(td::Slice name, PromiseT &&promise, ValueT &&value) {
+  AsyncApply<PromiseT, ValueT>::create(name, std::forward<PromiseT>(promise), std::forward<ValueT>(value));
 }
 }  // namespace ton

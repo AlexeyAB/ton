@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -31,7 +31,8 @@ class ValidateBroadcast : public td::actor::Actor {
   BlockHandle last_masterchain_block_handle_;
   td::Ref<MasterchainState> last_masterchain_state_;
   BlockHandle last_known_masterchain_block_handle_;
-  td::Ref<Proof> last_known_masterchain_block_proof_;
+
+  ProofLink::BasicHeaderInfo header_info_;
 
   td::actor::ActorId<ValidatorManager> manager_;
   td::Timestamp timeout_;
@@ -43,7 +44,11 @@ class ValidateBroadcast : public td::actor::Actor {
   td::Ref<ProofLink> proof_link_;
   BlockHandle handle_;
 
-  td::PerfWarningTimer perf_timer_{"validatebroadcast", 0.1};
+  td::PerfWarningTimer perf_timer_;
+
+  bool exact_key_block_handle_;
+  td::Ref<ProofLink> key_proof_link_;
+  td::Ref<MasterchainState> zero_state_;
 
  public:
   ValidateBroadcast(BlockBroadcast broadcast, BlockHandle last_masterchain_block_handle,
@@ -55,10 +60,18 @@ class ValidateBroadcast : public td::actor::Actor {
       , last_known_masterchain_block_handle_(std::move(last_known_masterchain_block_handle))
       , manager_(manager)
       , timeout_(timeout)
-      , promise_(std::move(promise)) {
+      , promise_(std::move(promise))
+      , perf_timer_("validatebroadcast", 0.1, [manager](double duration) {
+          send_closure(manager, &ValidatorManager::add_perf_timer_stat, "validatebroadcast", duration);
+        }) {
   }
 
   void start_up() override;
+  void got_key_block_id(BlockIdExt block_id);
+  void got_key_block_handle(ConstBlockHandle block_handle);
+  void got_key_block_proof_link(td::Ref<ProofLink> proof_link);
+  void got_zero_state(td::Ref<MasterchainState> state);
+  void check_signatures_common(td::Ref<ConfigHolder> conf);
   void checked_signatures();
   void got_block_handle(BlockHandle handle);
   void written_block_data();

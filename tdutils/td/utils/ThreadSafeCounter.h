@@ -14,13 +14,18 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
+
 #pragma once
-#include "td/utils/ThreadLocalStorage.h"
+
+#include "td/utils/common.h"
+#include "td/utils/Slice.h"
 #include "td/utils/StringBuilder.h"
+#include "td/utils/ThreadLocalStorage.h"
 
 #include <array>
+#include <atomic>
 #include <mutex>
 
 namespace td {
@@ -35,8 +40,15 @@ class ThreadSafeMultiCounter {
   int64 sum(size_t index) const {
     CHECK(index < N);
     int64 res = 0;
-    tls_.for_each([&](auto &value) { res += value[index].load(); });
+    tls_.for_each([&](auto &value) { res += value[index].load(std::memory_order_relaxed); });
     return res;
+  }
+  void clear() {
+    tls_.for_each([&](auto &value) {
+      for (auto &x : value) {
+        x = 0;
+      }
+    });
   }
 
  private:
@@ -87,7 +99,7 @@ class NamedThreadSafeCounter {
       }
     }
     CHECK(names_.size() < N);
-    names_.push_back(name.str());
+    names_.emplace_back(name.begin(), name.size());
     return get_counter_ref(names_.size() - 1);
   }
 
@@ -108,6 +120,11 @@ class NamedThreadSafeCounter {
     }
   }
 
+  void clear() {
+    std::unique_lock<std::mutex> guard(mutex_);
+    counter_.clear();
+  }
+
   friend StringBuilder &operator<<(StringBuilder &sb, const NamedThreadSafeCounter &counter) {
     counter.for_each([&sb](Slice name, int64 cnt) { sb << name << ": " << cnt << "\n"; });
     return sb;
@@ -120,4 +137,55 @@ class NamedThreadSafeCounter {
   Counter counter_;
 };
 
+// another class for simplicity, it
+struct NamedPerfCounter {
+ public:
+  static NamedPerfCounter &get_default() {
+    static NamedPerfCounter res;
+    return res;
+  }
+  struct PerfCounterRef {
+    NamedThreadSafeCounter::CounterRef count;
+    NamedThreadSafeCounter::CounterRef duration;
+  };
+  PerfCounterRef get_counter(Slice name) {
+    return {.count = counter_.get_counter(PSLICE() << name << ".count"),
+            .duration = counter_.get_counter(PSLICE() << name << ".duration")};
+  }
+
+  struct ScopedPerfCounterRef : public NoCopyOrMove {
+    PerfCounterRef perf_counter;
+    uint64 started_at_ticks{td::Clocks::rdtsc()};
+
+    ~ScopedPerfCounterRef() {
+      perf_counter.count.add(1);
+      perf_counter.duration.add(td::Clocks::rdtsc() - started_at_ticks);
+    }
+  };
+
+  template <class F>
+  void for_each(F &&f) const {
+    counter_.for_each(f);
+  }
+
+  void clear() {
+    counter_.clear();
+  }
+
+  friend StringBuilder &operator<<(StringBuilder &sb, const NamedPerfCounter &counter) {
+    return sb << counter.counter_;
+  }
+ private:
+  NamedThreadSafeCounter counter_;
+};
+
 }  // namespace td
+
+#define TD_PERF_COUNTER(name)                                                    \
+  static auto perf_##name = td::NamedPerfCounter::get_default().get_counter(td::Slice(#name)); \
+  auto scoped_perf_##name = td::NamedPerfCounter::ScopedPerfCounterRef{.perf_counter = perf_##name};
+
+#define TD_PERF_COUNTER_SINCE(name, since)                                       \
+  static auto perf_##name = td::NamedPerfCounter::get_default().get_counter(td::Slice(#name)); \
+  auto scoped_perf_##name =                                                      \
+      td::NamedPerfCounter::ScopedPerfCounterRef{.perf_counter = perf_##name, .started_at_ticks = since};

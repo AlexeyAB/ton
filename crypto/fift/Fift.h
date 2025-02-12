@@ -14,30 +14,27 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
 #include "SourceLookup.h"
-#include "vm/db/TonDb.h"
 #include "Dictionary.h"
 
 #include "td/utils/Status.h"
 
 namespace fift {
 struct IntCtx;
-int funny_interpret_loop(IntCtx& ctx);
 
 struct Fift {
  public:
   struct Config {
     fift::SourceLookup source_lookup;
-    vm::TonDb ton_db;
     fift::Dictionary dictionary;
     std::ostream* output_stream{&std::cout};
     std::ostream* error_stream{&std::cerr};
+    bool show_backtrace{true};
   };
-  // Fift must own ton_db and dictionary, no concurrent access is allowed
   explicit Fift(Config config);
 
   td::Result<int> interpret_file(std::string fname, std::string current_dir, bool interactive = false);
@@ -48,6 +45,6 @@ struct Fift {
  private:
   Config config_;
 
-  td::Result<int> do_interpret(IntCtx& ctx);
+  td::Result<int> do_interpret(IntCtx& ctx, bool is_interactive = false);
 };
 }  // namespace fift

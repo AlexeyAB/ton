@@ -14,19 +14,21 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "adnl/adnl-node-id.hpp"
 #include "td/utils/port/IPAddress.h"
+#include "ton/ton-types.h"
+#include "lite-client/ext-client.h"
 
 namespace tonlib {
 struct Config {
-  struct LiteClient {
-    ton::adnl::AdnlNodeIdFull adnl_id;
-    td::IPAddress address;
-  };
-  std::vector<LiteClient> lite_clients;
+  ton::BlockIdExt zero_state_id;
+  ton::BlockIdExt init_block_id;
+  std::vector<ton::BlockIdExt> hardforks;
+  std::vector<liteclient::LiteServerConfig> lite_servers;
+  std::string name;
   static td::Result<Config> parse(std::string str);
 };
 }  // namespace tonlib

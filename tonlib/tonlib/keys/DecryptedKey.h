@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include <vector>
@@ -48,7 +48,7 @@ struct RawDecryptedKey {
 
 struct EncryptedKey;
 struct DecryptedKey {
-  DecryptedKey() = default;
+  DecryptedKey() = delete;
   explicit DecryptedKey(const Mnemonic &mnemonic);
   DecryptedKey(std::vector<td::SecureString> mnemonic_words, td::Ed25519::PrivateKey key);
   DecryptedKey(RawDecryptedKey key);
@@ -56,8 +56,6 @@ struct DecryptedKey {
   std::vector<td::SecureString> mnemonic_words;
   td::Ed25519::PrivateKey private_key;
 
-  static td::SecureString change_local_password(td::Slice secret, td::Slice old_local_password,
-                                                td::Slice new_local_password);
   EncryptedKey encrypt(td::Slice local_password, td::Slice secret = {}) const;
 };
 

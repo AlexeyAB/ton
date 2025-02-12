@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "common/refcnt.hpp"
@@ -58,7 +58,7 @@ unsigned long long bits_load_long_top(ConstBitPtr from, unsigned top_bits);
 long long bits_load_long(ConstBitPtr from, unsigned bits);
 unsigned long long bits_load_ulong(ConstBitPtr from, unsigned bits);
 long parse_bitstring_hex_literal(unsigned char* buff, std::size_t buff_size, const char* str, const char* str_end);
-long parse_bitstring_binary_literal(BitPtr buff, std::size_t buff_size, const char* str, const char* str_end);
+long parse_bitstring_binary_literal(BitPtr buff, std::size_t buff_size_bits, const char* str, const char* str_end);
 
 void bits_sha256(BitPtr to, ConstBitPtr from, std::size_t size);
 
@@ -127,6 +127,9 @@ struct BitPtrGen {
   }
   std::size_t scan(bool value, std::size_t len) const {
     return bitstring::bits_memscan(*this, len, value);
+  }
+  bool is_zero(std::size_t len) const {
+    return scan(false, len) == len;
   }
   long long get_int(unsigned bits) const {
     return bitstring::bits_load_long(*this, bits);
@@ -220,6 +223,8 @@ class BitSliceGen {
   BitSliceGen(const BitSliceGen& bs, unsigned _offs, unsigned _len);
   BitSliceGen(BitSliceGen&& bs, unsigned _offs, unsigned _len);
   BitSliceGen(Pt* _ptr, unsigned _len) : ref(), ptr(_ptr), offs(0), len(_len) {
+  }
+  explicit BitSliceGen(Slice slice) : BitSliceGen(slice.data(), slice.size() * 8) {
   }
   ~BitSliceGen() {
   }
@@ -467,7 +472,7 @@ class BitArray {
   unsigned char* data() {
     return bytes.data();
   }
-  unsigned size() const {
+  static unsigned size() {
     return n;
   }
   const byte_array_t& as_array() const {
@@ -549,11 +554,7 @@ class BitArray {
     set_same(0);
   }
   void set_zero_s() {
-    volatile uint8* p = data();
-    auto x = m;
-    while (x--) {
-      *p++ = 0;
-    }
+    as_slice().fill_zero_secure();
   }
   void set_ones() {
     set_same(1);
@@ -569,6 +570,14 @@ class BitArray {
   }
   std::string to_binary() const {
     return bitstring::bits_to_binary(cbits(), size());
+  }
+  long from_hex(td::Slice hex_str, bool allow_partial = false) {
+    auto res = bitstring::parse_bitstring_hex_literal(data(), m, hex_str.begin(), hex_str.end());
+    return allow_partial ? std::min<long>(res, n) : (res == n ? res : -1);
+  }
+  long from_binary(td::Slice bin_str, bool allow_partial = false) {
+    auto res = bitstring::parse_bitstring_binary_literal(bits(), n, bin_str.begin(), bin_str.end());
+    return allow_partial ? std::min<long>(res, n) : (res == n ? res : -1);
   }
   int compare(const BitArray& other) const {
     return (n % 8 == 0) ? std::memcmp(data(), other.data(), n / 8) : bitstring::bits_memcmp(bits(), other.bits(), n);

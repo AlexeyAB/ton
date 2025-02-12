@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "tl_writer_td.h"
 
@@ -68,7 +68,7 @@ int TD_TL_writer::get_storer_type(const tl::tl_combinator *t, const std::string 
 
 tl::TL_writer::Mode TD_TL_writer::get_parser_mode(int type) const {
   if (tl_name == "tonlib_api") {
-#ifndef TD_ENABLE_JNI  // we need to parse all types in order to implement toString
+#ifndef TONLIB_ENABLE_JNI  // we need to parse all types in order to implement toString
     return Server;
 #endif
   }
@@ -123,6 +123,12 @@ std::string TD_TL_writer::gen_base_function_class_name() const {
 std::string TD_TL_writer::gen_class_name(std::string name) const {
   if (name == "Object") {
     //assert(false);
+  }
+  if (name == "function") {
+    return "Function";
+  }
+  if (name == "object") {
+    return "Object";
   }
   if (name == "#") {
     return "std::int32_t";

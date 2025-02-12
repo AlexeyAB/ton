@@ -14,13 +14,14 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
 #include "auto/tl/tonlib_api.h"
 
 namespace tonlib_api = ton::tonlib_api;
+namespace tonlib {
 
 class TonlibCallback {
  public:
@@ -28,3 +29,4 @@ class TonlibCallback {
   virtual void on_error(std::uint64_t id, tonlib_api::object_ptr<tonlib_api::error> error) = 0;
   virtual ~TonlibCallback() = default;
 };
+}  // namespace tonlib

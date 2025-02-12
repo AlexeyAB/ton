@@ -1,11 +1,13 @@
+The most convenient way to compile and run a node is provided by MyTonCtrl: https://github.com/ton-blockchain/mytonctrl/. More info is available on https://ton.org/docs/#/nodes/run-node.
+
 The aim of this document is to provide step-by-step instructions for setting up a full node for the TON Blockchain. We assume some familiarity with the TON Blockchain Lite Client, at least to the extent explained in the Lite Client HOWTO.
 
-Notice that you need a machine with a public IP address and a high-bandwidth network connection to run a TON Blockchain Full Node. Typically you'll need a sufficiently powerful server in a datacenter. It is a bad idea to run a Full Node on your home computer; instead, you could run a Full Node on a remote server, and use the TON Blockchain Lite Client to connect to it from home.
+Note that you need a machine with a public IP address and a high-bandwidth network connection to run a TON Blockchain Full Node. Typically you'll need a sufficiently powerful server in a datacenter with good network connectivity, using at least a 1 Gbit/s connection to reliably accommodate peak loads (the average load is expected to be approximately 100 Mbit/s). We recommend a dual-processor server with at least eight cores in each processor, at least 256 MiB RAM, at least 8 TB of conventional HDD storage and at least 512 GB of faster SSD storage. It is a bad idea to run a Full Node on your home computer; instead, you could run a Full Node on a remote server, and use the TON Blockchain Lite Client to connect to it from home.
 
 0. Downloading and compiling
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The complete TON Blockchain Library and Validator software is downloaded and compiled similarly to the Lite Client. This process is outlined in the corresponding README file. The most important difference is that you have to download the complete source archive available at https://test.ton.org/ton-blockchain-full.tar.xz instead of the smaller Lite Client source archive. You should also build all goals defined in CMakeLists.txt (e.g. by running `cmake <path-to-source-directory>` and `make` in your build directory), not only those specifically related to the Lite Client (which is also included in the larger distribution).
+The complete TON Blockchain Library and Validator software is downloaded and compiled similarly to the Lite Client. This process is outlined in the corresponding README file. The most important difference is that you have to download the complete sources from public GitHub repository https://github.com/ton-blockchain/ton (e.g., by running `git clone https://github.com/ton-blockchain/ton` and `git submodule update` afterwards) instead of downloading the smaller Lite Client source archive. You should also build all goals defined in CMakeLists.txt (e.g. by running `cmake <path-to-source-directory>` and `make` in your build directory), not only those specifically related to the Lite Client (which is also included in the larger distribution; you don't have to download and build it separately). We strongly recommend building a "release" or a "release with debug information" version of the TON Blockchain Library and especially of the Validator/Full Node by passing `-DCMAKE_BUILD_TYPE=Release` or `-DCMAKE_BUILD_TYPE=RelWithDebInfo` as an extra argument to `cmake` during its first run (if you forgot to do this, you can later delete file `CMakeCache.txt` from your build directory and re-run `cmake` with the appropriate options).
 
 1. Full Node binaries
 ~~~~~~~~~~~~~~~~~~~~~
@@ -39,28 +41,28 @@ An approximate layout of the working directory of the TON Blockchain Full Node s
 
 In order to set up your Full Node, you'll need a special JSON file called the "global configuration (file)". It is called this because it is the same for all full nodes, and even nodes participating in different instances of the TON Blockchain (e.g., "testnet" vs. "mainnet") share an almost identical global configuration.
 
-The "testnet" global configuration can be downloaded at https://test.ton.org/ton-global.config.json as follows:
+The "mainnet" global configuration can be downloaded at https://ton.org/global-config.json as follows:
 
-$ wget https://test.ton.org/ton-global.config.json
+$ wget https://ton.org/global-config.json
 
-You may wish to put this file into /var/ton-work/etc/ton-global.config.json .
+You may wish to put this file into /var/ton-work/etc/global-config.json .
 
 We'll discuss the structure of this file later in more detail. For now, let us remark that the bulk of this file consists of a list of known TON DHT nodes required for the bootstrapping of the TON Network. A smaller section near the end of this file describes the particular instance of the TON Blockchain that we wish to connect to.
 
 All instances of the TON Blockchain use the same "global" TON Network (i.e., the TON Network is not fragmented into several instances for each blockchain instance). While the global network configuration is therefore independent of the particular TON Blockchain instance chosen, the Full Nodes belonging to different instances will later connect to different overlay subnetworks inside the TON Network.
 
-It is important to distinguish this "global configuration file", used for setting up a TON Blockchain Full Node, and the "local" or "automatic configuration file", automatically updated by validator-engine and usually stored in ${DB_ROOT}/config.json. The global configuration is used only once to generate the initial automatic configuration file, which is thereafter updated by validator-engine itself (e.g., by adding new DHT nodes or storing hashes of newer masterchain blocks).
+It is important to distinguish this "global configuration file", used for setting up a TON Blockchain Full Node, and the "local" or "automatic configuration file", automatically updated by validator-engine and usually stored in ${DB_ROOT}/config.json. The global configuration is used to generate the initial automatic configuration file, which is thereafter updated by validator-engine itself (e.g., by adding new DHT nodes or storing hashes of newer masterchain blocks).
 
 5. Initializing the local configuration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Once the global configuration file is downloaded, it can be used to create the initial local configuration in ${DB_ROOT}/config.json. To do this, execute validator-engine once:
 
-$ validator-engine -C /var/ton-work/etc/ton-global.config.json --db /var/ton-work/db/ --ip <IP>:<PORT> -l /var/ton-work/log
+$ validator-engine -C /var/ton-work/etc/global-config.json --db /var/ton-work/db/ --ip <IP>:<PORT> -l /var/ton-work/log
 
-Here `/var/ton-work/log` is the log directory of `validator-engine`, where it will create its log files. The argument to the `-C` command-line option is the global configuration file downloaded from test.ton.org as explained above, and `/var/ton-work/db/` is the working directory ${DB_ROOT}. Finally, <IP>:<PORT> are the global IP address of this full node (you need to indicate a public IPv4 address here) and the UDP port used to run TON Network protocols such as ADNL and RLDP. Make sure that your firewall is configured to pass UDP packets with source or destination <IP>:<PORT> at least for the `validator-engine` binary.
+Here `/var/ton-work/log` is the log directory of `validator-engine`, where it will create its log files. The argument to the `-C` command-line option is the global configuration file downloaded from ton.org as explained above, and `/var/ton-work/db/` is the working directory ${DB_ROOT}. Finally, <IP>:<PORT> are the global IP address of this full node (you need to indicate a public IPv4 address here) and the UDP port used to run TON Network protocols such as ADNL and RLDP. Make sure that your firewall is configured to pass UDP packets with source or destination <IP>:<PORT> at least for the `validator-engine` binary.
 
-When validator-engine is invoked as above, and ${DB_ROOT}/config.json does not exist, it creates a new local configuration file ${DB_ROOT}/config.json using the information from the global configuration file and from the command-line options such as --ip, and then exits. If ${DB_ROOT}/config.json already exists, it is not rewritten; instead the global configuration is ignored, and validator-engine starts up as a daemon using the local configuration.
+When validator-engine is invoked as above, and ${DB_ROOT}/config.json does not exist, it creates a new local configuration file ${DB_ROOT}/config.json using the information from the global configuration file and from the command-line options such as --ip, and then exits. If ${DB_ROOT}/config.json already exists, it is not rewritten; instead validator-engine starts up as a daemon using both the local and the global configuration.
 
 If you need to change the local configuration afterwards, you'll need to either delete this file and regenerate it from the global configuration (potentially forgetting other important information accumulated in the local configuration), or edit the local configuration in a text editor (when validator-engine is not running).
 
@@ -107,16 +109,16 @@ Replace it with the following:
   }
 ],
 
-`control.0.id` is set to the base64 identifier of the server's public key, and `control.0.allowed.0.id` is the base64 identifier of the client's public key. <CONSOLE-PORT> is the UDP port the server will listen to for console commands.
+`control.0.id` is set to the base64 identifier of the server's public key, and `control.0.allowed.0.id` is the base64 identifier of the client's public key. <CONSOLE-PORT> is the TCP port the server will listen to for console commands.
 
 7. Running the Full Node
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 To run the full node, simply run the validator-engine binary in a console:
 
-$ validator-engine --db ${DB_ROOT} -l /var/ton-work/log
+$ validator-engine --db ${DB_ROOT} -C /var/ton-work/etc/global-config.json  -l /var/ton-work/log
 
-It will read the local configuration from ${DB_ROOT}/config.json, and continue running silently. You should write suitable scripts for invoking validator-engine as a daemon (so that it does not terminate when the console is closed), but we'll skip these considerations for simplicity. (Using "nohup" is a cheap way of achieving this on some Linux systems.)
+It will read the global configuration from /var/ton-work/etc/global-config.json, the local configuration from ${DB_ROOT}/config.json, and continue running silently. You should write suitable scripts for invoking validator-engine as a daemon (so that it does not terminate when the console is closed), but we'll skip these considerations for simplicity. (The command-line option `-d` of validator-engine should be sufficient for this on most *nix systems.)
 
 If the configuration is invalid, validator-engine will terminate immediately and, in most cases, output nothing. You'll have to study the log files under /var/ton-work/log to find out what went wrong. Otherwise, validator-engine will keep working silently. Again, you can understand what's going on by inspecting the log files, and by looking into subdirectories of the ${DB_ROOT} directory.
 

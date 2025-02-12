@@ -23,7 +23,7 @@
     exception statement from your version. If you delete this exception statement 
     from all source files in the program, then also delete it here.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include <vector>
 #include <string>
@@ -81,6 +81,7 @@ void define_keywords() {
       .add_kw_char('=')
       .add_kw_char('_')
       .add_kw_char('?')
+      .add_kw_char('.')
       .add_kw_char('~')
       .add_kw_char('^');
 
@@ -101,13 +102,15 @@ unsigned long long get_special_value(std::string str) {
   unsigned long long val = 0;
   int bits = 0;
   if (str[0] == '#') {
-    while (i < n) {
-      int c = str[i++];
+    for (; i < n; i++) {
+      int c = str[i];
       if (c == '_') {
         break;
       }
       if (c >= '0' && c <= '9') {
         c -= '0';
+      } else if (c >= 'A' && c <= 'F') {
+        c -= 'A' - 10;
       } else if (c >= 'a' && c <= 'f') {
         c -= 'a' - 10;
       } else {
@@ -143,6 +146,9 @@ unsigned long long get_special_value(std::string str) {
   if (i == n - 1 && bits) {
     // trailing _
     while (bits && !((val >> (64 - bits)) & 1)) {
+      --bits;
+    }
+    if (bits) {
       --bits;
     }
   }
@@ -212,6 +218,8 @@ inline bool is_uc_ident(sym_idx_t idx) {
 }  // namespace sym
 
 namespace tlbc {
+
+td::LinearAllocator AR(1 << 22);
 
 /*
  * 
@@ -412,7 +420,7 @@ void AdmissibilityInfo::operator|=(const AdmissibilityInfo& other) {
   std::size_t i, j, n = info.size(), n1 = other.info.size();
   assert(n1 && !(n1 & (n1 - 1)));
   for (i = j = 0; i < n; i++) {
-    info[i] = info[i] | other.info[j];
+    info[i] = info[i] || other.info[j];
     j = (j + 1) & (n1 - 1);
   }
 }
@@ -686,7 +694,7 @@ unsigned long long BinTrie::build_submap(int depth, unsigned long long A[]) cons
   } else {
     std::memset(A + n, 0, n * 8);
   }
-  if (A[n] != A[n - 1] || (long)A[n] < 0) {
+  if (A[n] != A[n - 1] || (long long)A[n] < 0) {
     r2 |= 1;
   } else {
     r2 &= ~1;
@@ -900,7 +908,7 @@ bool TypeExpr::no_tchk() const {
 }
 
 TypeExpr* TypeExpr::mk_intconst(const src::SrcLocation& loc, unsigned int_const) {
-  return new TypeExpr{loc, te_IntConst, (int)int_const};
+  return new (AR) TypeExpr{loc, te_IntConst, (int)int_const};
 }
 
 TypeExpr* TypeExpr::mk_intconst(const src::SrcLocation& loc, std::string int_const) {
@@ -945,16 +953,16 @@ TypeExpr* TypeExpr::mk_mulint(const src::SrcLocation& loc, TypeExpr* expr1, Type
     return expr2;
   }
   // delete expr2;
-  return new TypeExpr{loc, te_MulConst, val, {expr1}, expr1->negated};
+  return new (AR) TypeExpr{loc, te_MulConst, val, {expr1}, expr1->negated};
 }
 
 TypeExpr* TypeExpr::mk_apply(const src::SrcLocation& loc, int tp, TypeExpr* expr1, TypeExpr* expr2) {
-  TypeExpr* expr = new TypeExpr{loc, tp, 0, {expr1, expr2}};
+  TypeExpr* expr = new (AR) TypeExpr{loc, tp, 0, {expr1, expr2}};
   return expr;
 }
 
 TypeExpr* TypeExpr::mk_cellref(const src::SrcLocation& loc, TypeExpr* expr1) {
-  TypeExpr* expr = new TypeExpr{loc, te_Ref, 0, {expr1}};
+  TypeExpr* expr = new (AR) TypeExpr{loc, te_Ref, 0, {expr1}};
   return expr;
 }
 
@@ -1040,7 +1048,7 @@ bool TypeExpr::close(const src::SrcLocation& loc) {
 }
 
 TypeExpr* TypeExpr::mk_apply_empty(const src::SrcLocation& loc, sym_idx_t name, Type* type_applied) {
-  TypeExpr* expr = new TypeExpr{loc, te_Apply, name};
+  TypeExpr* expr = new (AR) TypeExpr{loc, te_Apply, name};
   expr->type_applied = type_applied;
   expr->is_nat_subtype = (type_applied->produces_nat && !type_applied->arity);
   return expr;
@@ -1128,6 +1136,19 @@ void TypeExpr::show(std::ostream& os, const Constructor* cs, int prio, int mode)
       }
       break;
     }
+    case te_GetBit: {
+      assert(args.size() == 2);
+      if (prio > 97) {
+        os << '(';
+      }
+      args[0]->show(os, cs, 98, mode);
+      os << ".";  // priority 20
+      args[1]->show(os, cs, 98, mode);
+      if (prio > 97) {
+        os << ')';
+      }
+      break;
+    }
     case te_IntConst: {
       assert(args.empty());
       os << value;
@@ -1202,11 +1223,12 @@ int abstract_nat_const(int value) {
 }
 
 unsigned char abstract_add_base_table[4][4] = {{0, 1, 2, 3}, {1, 2, 3, 2}, {2, 3, 2, 3}, {3, 2, 3, 2}};
-
 unsigned char abstract_mul_base_table[4][4] = {{0, 0, 0, 0}, {0, 1, 2, 3}, {0, 2, 2, 2}, {0, 3, 2, 3}};
+unsigned char abstract_getbit_b_table[4][4] = {{1, 1, 1, 1}, {2, 1, 1, 1}, {1, 3, 3, 3}, {2, 3, 3, 3}};
 
 unsigned char abstract_add_table[16][16];
 unsigned char abstract_mul_table[16][16];
+unsigned char abstract_getbit_table[16][16];
 
 void compute_semilat_table(unsigned char table[16][16], const unsigned char base_table[4][4]) {
   for (int x = 0; x < 16; x++) {
@@ -1226,9 +1248,28 @@ void compute_semilat_table(unsigned char table[16][16], const unsigned char base
   }
 }
 
+void compute_semilat_b_table(unsigned char table[16][16], const unsigned char b_table[4][4]) {
+  for (int x = 0; x < 16; x++) {
+    for (int y = 0; y < 16; y++) {
+      int res = 0;
+      for (int i = 0; i < 4; i++) {
+        if ((x >> i) & 1) {
+          for (int j = 0; j < 4; j++) {
+            if ((y >> j) & 1) {
+              res |= b_table[i][j];
+            }
+          }
+        }
+      }
+      table[x][y] = (unsigned char)res;
+    }
+  }
+}
+
 void init_abstract_tables() {
   compute_semilat_table(abstract_add_table, abstract_add_base_table);
   compute_semilat_table(abstract_mul_table, abstract_mul_base_table);
+  compute_semilat_b_table(abstract_getbit_table, abstract_getbit_b_table);
 }
 
 int abstract_add(int x, int y) {
@@ -1237,6 +1278,10 @@ int abstract_add(int x, int y) {
 
 int abstract_mul(int x, int y) {
   return abstract_mul_table[x & 15][y & 15];
+}
+
+int abstract_getbit(int x, int y) {
+  return abstract_getbit_table[x & 15][y & 15];
 }
 
 int TypeExpr::abstract_interpret_nat() const {
@@ -1249,6 +1294,9 @@ int TypeExpr::abstract_interpret_nat() const {
     case te_Add:
       assert(args.size() == 2);
       return abstract_add(args[0]->abstract_interpret_nat(), args[1]->abstract_interpret_nat());
+    case te_GetBit:
+      assert(args.size() == 2);
+      return abstract_getbit(args[0]->abstract_interpret_nat(), args[1]->abstract_interpret_nat());
     case te_IntConst:
       return abstract_nat_const(value);
     case te_MulConst:
@@ -1464,6 +1512,11 @@ void TypeExpr::const_type_name(std::ostream& os) const {
       os << "_plus";
       args[1]->const_type_name(os);
       return;
+    case te_GetBit:
+      args[0]->const_type_name(os);
+      os << "_bit";
+      args[1]->const_type_name(os);
+      return;
     case te_IntConst:
       os << "_" << value;
       return;
@@ -1571,6 +1624,13 @@ bool TypeExpr::bind_value(bool value_negated, Constructor& cs, bool checking_typ
       assert(is_nat && args.size() == 1 && value > 0);
       assert(negated == args[0]->negated);
       args[0]->bind_value(value_negated, cs);
+      return true;
+    }
+    case te_GetBit: {
+      assert(is_nat && args.size() == 2 && !args[0]->negated && !args[1]->negated);
+      assert(!negated);
+      args[0]->bind_value(false, cs);
+      args[1]->bind_value(false, cs);
       return true;
     }
     case te_Type: {
@@ -1740,9 +1800,6 @@ void Constructor::show(std::ostream& os, int mode) const {
   }
   for (int i = 0; i < type_arity; i++) {
     os << ' ';
-    if (param_negated.at(i)) {
-      os << '~';
-    }
     params.at(i)->show(os, this, 100, mode | 1);
   }
   if (!(mode & 2)) {
@@ -1926,7 +1983,7 @@ void parse_field_list(Lexer& lex, Constructor& cs);
 
 TypeExpr* parse_anonymous_constructor(Lexer& lex, Constructor& cs) {
   sym::open_scope(lex);
-  Constructor* cs2 = new Constructor(lex.cur().loc);  // anonymous constructor
+  Constructor* cs2 = new (AR) Constructor(lex.cur().loc);  // anonymous constructor
   parse_field_list(lex, *cs2);
   if (lex.tp() != ']') {
     lex.expect(']');
@@ -1938,7 +1995,7 @@ TypeExpr* parse_anonymous_constructor(Lexer& lex, Constructor& cs) {
       if (types[i].parent_type_idx >= 0) {
         types[i].parent_type_idx = -2;
       }
-      delete cs2;
+      cs2->~Constructor();
       return TypeExpr::mk_apply_empty(lex.cur().loc, 0, &types[i]);
     }
   }
@@ -2031,7 +2088,7 @@ TypeExpr* parse_term(Lexer& lex, Constructor& cs, int mode) {
     }
     int i = sym_val->idx;
     assert(i >= 0 && i < cs.fields_num);
-    auto res = new TypeExpr{lex.cur().loc, TypeExpr::te_Param, i};
+    auto res = new (AR) TypeExpr{lex.cur().loc, TypeExpr::te_Param, i};
     auto field_type = cs.fields[i].type;
     assert(field_type);
     if ((mode & 4) && !cs.fields[i].known) {
@@ -2057,10 +2114,34 @@ TypeExpr* parse_term(Lexer& lex, Constructor& cs, int mode) {
   }
 }
 
-// E ? E [ : E ]
-
-TypeExpr* parse_expr95(Lexer& lex, Constructor& cs, int mode) {
+// E[.E]
+TypeExpr* parse_expr97(Lexer& lex, Constructor& cs, int mode) {
   TypeExpr* expr = parse_term(lex, cs, mode | 3);
+  if (lex.tp() == '.') {
+    src::SrcLocation where = lex.cur().loc;
+    expr->close(lex.cur().loc);
+    // std::cerr << "parse ., mode " << mode << std::endl;
+    if (!(mode & 2)) {
+      throw src::ParseError{where, "bitfield expression cannot be used instead of a type expression"};
+    }
+    if (!expr->is_nat) {
+      throw src::ParseError{where, "cannot apply bit selection operator `.` to types"};
+    }
+    lex.next();
+    TypeExpr* expr2 = parse_term(lex, cs, mode & ~1);
+    expr2->close(lex.cur().loc);
+    if (expr->negated || expr2->negated) {
+      throw src::ParseError{where, "cannot apply bit selection operator `.` to values of negative polarity"};
+    }
+    expr = TypeExpr::mk_apply(where, TypeExpr::te_GetBit, expr, expr2);
+  }
+  expr->check_mode(lex.cur().loc, mode);
+  return expr;
+}
+
+// E ? E [ : E ]
+TypeExpr* parse_expr95(Lexer& lex, Constructor& cs, int mode) {
+  TypeExpr* expr = parse_expr97(lex, cs, mode | 3);
   if (lex.tp() != '?') {
     expr->check_mode(lex.cur().loc, mode);
     return expr;
@@ -2168,11 +2249,9 @@ TypeExpr* parse_expr10(Lexer& lex, Constructor& cs, int mode) {
   }
   if (op == '>') {
     std::swap(expr, expr2);
-    op = '<';
     op_name = Less_name;
   } else if (op == src::_Geq) {
     std::swap(expr, expr2);
-    op = src::_Leq;
     op_name = Leq_name;
   }
   auto sym_def = sym::lookup_symbol(op_name, 2);
@@ -2263,7 +2342,7 @@ void parse_constructor_def(Lexer& lex) {
   }
   //std::cerr << "parsing constructor `" << sym::symbols.get_name(constr_name) << "` with tag " << std::hex << tag
   //          << std::dec << std::endl;
-  auto cs_ref = new Constructor(where, constr_name, 0, tag);
+  auto cs_ref = new (AR) Constructor(where, constr_name, 0, tag);
   Constructor& cs = *cs_ref;
   cs.is_special = is_special;
   parse_field_list(lex, cs);
@@ -2335,9 +2414,11 @@ void parse_constructor_def(Lexer& lex) {
  * 
  */
 
-bool parse_source(std::istream* is, const src::FileDescr* fdescr) {
+std::vector<const src::FileDescr*> source_fdescr;
+
+bool parse_source(std::istream* is, src::FileDescr* fdescr) {
   src::SourceReader reader{is, fdescr};
-  src::Lexer lex{reader, true, "(){}:;? #$. ^~ #", "//", "/*", "*/"};
+  src::Lexer lex{reader, true, "(){}:;? #$. ^~ #", "//", "/*", "*/", ""};
   while (lex.tp() != src::_Eof) {
     parse_constructor_def(lex);
     // std::cerr << lex.cur().str << '\t' << lex.cur().name_str() << std::endl;
@@ -2350,6 +2431,7 @@ bool parse_source_file(const char* filename) {
     throw src::Fatal{"source file name is an empty string"};
   }
   src::FileDescr* cur_source = new src::FileDescr{filename};
+  source_fdescr.push_back(cur_source);
   std::ifstream ifs{filename};
   if (ifs.fail()) {
     throw src::Fatal{std::string{"cannot open source file `"} + filename + "`"};
@@ -2358,7 +2440,9 @@ bool parse_source_file(const char* filename) {
 }
 
 bool parse_source_stdin() {
-  return parse_source(&std::cin, new src::FileDescr{"stdin", true});
+  src::FileDescr* cur_source = new src::FileDescr{"stdin", true};
+  source_fdescr.push_back(cur_source);
+  return parse_source(&std::cin, cur_source);
 }
 
 /*
@@ -2384,7 +2468,7 @@ Type* define_builtin_type(std::string name_str, std::string args, bool produces_
   }
   auto sym_def = sym::define_global_symbol(name, true);
   assert(sym_def);
-  sym_def->value = new SymValType{type};
+  sym_def->value = new (AR) SymValType{type};
   if (size < 0) {
     type->size = MinMaxSize::Any;
   } else if (min_size >= 0 && min_size != size) {
@@ -2424,7 +2508,7 @@ void define_builtins() {
   Bits_type = define_builtin_type("bits", "#", false, 1023, 0, true, 0);
   for (int i = 1; i <= 257; i++) {
     char buff[8];
-    sprintf(buff, "uint%d", i);
+    snprintf(buff, sizeof(buff), "uint%d", i);
     define_builtin_type(buff + 1, "", false, i, i, true, -1);
     if (i < 257) {
       define_builtin_type(buff, "", false, i, i, true, 1);
@@ -2432,7 +2516,7 @@ void define_builtins() {
   }
   for (int i = 1; i <= 1023; i++) {
     char buff[12];
-    sprintf(buff, "bits%d", i);
+    snprintf(buff, sizeof(buff), "bits%d", i);
     define_builtin_type(buff, "", false, i, i, true, 0);
   }
   Eq_type = define_builtin_type("=", "##", false, 0, 0, true);

@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -29,7 +29,6 @@
 
 #include <atomic>
 #include <memory>
-#include <type_traits>
 
 namespace td {
 
@@ -150,7 +149,10 @@ class PollableFdInfo : private ListNode {
 
  private:
   NativeFd fd_{};
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-pragma"
   std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+#pragma clang diagnostic pop
   PollFlagsSet flags_;
 #if TD_PORT_WINDOWS
   SpinLock observer_lock_;
@@ -219,30 +221,6 @@ inline PollFlags PollableFd::get_flags_unsafe() const {
 inline const NativeFd &PollableFd::native_fd() const {
   return fd_info_->native_fd();
 }
-
-#if TD_PORT_POSIX
-namespace detail {
-template <class F>
-auto skip_eintr(F &&f) {
-  decltype(f()) res;
-  static_assert(std::is_integral<decltype(res)>::value, "integral type expected");
-  do {
-    errno = 0;  // just in case
-    res = f();
-  } while (res < 0 && errno == EINTR);
-  return res;
-}
-template <class F>
-auto skip_eintr_cstr(F &&f) {
-  char *res;
-  do {
-    errno = 0;  // just in case
-    res = f();
-  } while (res == nullptr && errno == EINTR);
-  return res;
-}
-}  // namespace detail
-#endif
 
 template <class FdT>
 bool can_read(const FdT &fd) {

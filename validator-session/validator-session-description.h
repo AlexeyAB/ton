@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -85,6 +85,7 @@ class ValidatorSessionDescription {
   virtual ValidatorWeight get_total_weight() const = 0;
   virtual td::int32 get_node_priority(td::uint32 src_idx, td::uint32 round) const = 0;
   virtual td::uint32 get_max_priority() const = 0;
+  virtual td::uint32 get_node_by_priority(td::uint32 round, td::uint32 priority) const = 0;
   virtual td::uint32 get_unixtime(td::uint64 t) const = 0;
   virtual td::uint32 get_attempt_seqno(td::uint64 t) const = 0;
   virtual td::uint32 get_self_idx() const = 0;

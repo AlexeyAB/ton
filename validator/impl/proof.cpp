@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "proof.hpp"
 #include "block/block-parse.h"
@@ -43,15 +43,15 @@ td::Result<Ref<ProofLink>> ProofQ::export_as_proof_link() const {
 }
 
 td::Result<BlockSeqno> ProofLinkQ::prev_key_mc_seqno() const {
-  if (!id_.is_masterchain()) {
-    return td::Status::Error(
-        -668, "cannot compute previous key masterchain block from ProofLink of non-masterchain block "s + id_.to_str());
-  }
-  TRY_RESULT(pair, get_virtual_root(true));
+  //if (!id_.is_masterchain()) {
+  //  return td::Status::Error(
+  //      -668, "cannot compute previous key masterchain block from ProofLink of non-masterchain block "s + id_.to_str());
+  //}
+  TRY_RESULT(virt, get_virtual_root(true));
   try {
     block::gen::Block::Record blk;
     block::gen::BlockInfo::Record info;
-    if (!(tlb::unpack_cell(std::move(pair.first), blk) && tlb::unpack_cell(blk.info, info) && !info.version)) {
+    if (!(tlb::unpack_cell(std::move(virt.root), blk) && tlb::unpack_cell(blk.info, info) && !info.version)) {
       return td::Status::Error(-668,
                                "cannot unpack block header in the Merkle proof for masterchain block "s + id_.to_str());
     }
@@ -66,19 +66,38 @@ td::Result<td::Ref<ConfigHolder>> ProofLinkQ::get_key_block_config() const {
     return td::Status::Error(
         -668, "cannot compute previous key masterchain block from ProofLink of non-masterchain block "s + id_.to_str());
   }
-  TRY_RESULT(pair, get_virtual_root(true));
+  TRY_RESULT(virt, get_virtual_root(true));
   try {
-    TRY_RESULT(cfg, block::Config::extract_from_key_block(
-                        std::move(pair.first), block::Config::needValidatorSet | block::Config::needWorkchainInfo));
-    return td::make_ref<ConfigHolderQ>(std::move(cfg), std::move(pair.second));
+    TRY_RESULT(cfg, block::Config::extract_from_key_block(std::move(virt.root), block::Config::needValidatorSet));
+    return td::make_ref<ConfigHolderQ>(std::move(cfg), std::move(virt.boc));
   } catch (vm::VmVirtError &) {
     return td::Status::Error(-668,
                              "virtualization error while traversing masterchain block proof for "s + id_.to_str());
   }
 }
 
-td::Result<std::pair<Ref<vm::Cell>, std::shared_ptr<vm::StaticBagOfCellsDb>>> ProofLinkQ::get_virtual_root(
-    bool lazy) const {
+td::Result<ProofLink::BasicHeaderInfo> ProofLinkQ::get_basic_header_info() const {
+  BasicHeaderInfo res;
+  TRY_RESULT(virt, get_virtual_root(true));
+  try {
+    block::gen::Block::Record blk;
+    block::gen::BlockInfo::Record info;
+    if (!(tlb::unpack_cell(std::move(virt.root), blk) && tlb::unpack_cell(blk.info, info) && !info.version)) {
+      return td::Status::Error(-668,
+                               "cannot unpack block header in the Merkle proof for masterchain block "s + id_.to_str());
+    }
+    res.cc_seqno = info.gen_catchain_seqno;
+    res.utime = info.gen_utime;
+    res.end_lt = info.end_lt;
+    res.validator_set_hash = info.gen_validator_list_hash_short;
+    res.prev_key_mc_seqno = info.prev_key_block_seqno;
+    return res;
+  } catch (vm::VmVirtError &) {
+    return td::Status::Error(-668, "virtualization error in masterchain block proof for "s + id_.to_str());
+  }
+}
+
+td::Result<ProofLinkQ::VirtualizedProof> ProofLinkQ::get_virtual_root(bool lazy) const {
   if (data_.empty()) {
     return td::Status::Error(-668, "block proof is empty");
   }
@@ -87,7 +106,7 @@ td::Result<std::pair<Ref<vm::Cell>, std::shared_ptr<vm::StaticBagOfCellsDb>>> Pr
   if (lazy) {
     vm::StaticBagOfCellsDbLazy::Options options;
     options.check_crc32c = true;
-    auto res = vm::StaticBagOfCellsDbLazy::create(vm::BufferSliceBlobView::create(data_.clone()), options);
+    auto res = vm::StaticBagOfCellsDbLazy::create(td::BufferSliceBlobView::create(data_.clone()), options);
     if (res.is_error()) {
       return res.move_as_error();
     }
@@ -124,19 +143,58 @@ td::Result<std::pair<Ref<vm::Cell>, std::shared_ptr<vm::StaticBagOfCellsDb>>> Pr
                                        " contains a Merkle proof with incorrect root hash: expected " +
                                        proof_blk_id.root_hash.to_hex() + ", found " + virt_hash.to_hex());
   }
-  return std::make_pair(std::move(virt_root), std::move(boc));
+  return VirtualizedProof{std::move(virt_root), proof.signatures->prefetch_ref(), std::move(boc)};
 }
 
-td::Ref<ValidatorSet> ConfigHolderQ::get_total_validator_set(int next) const {
-  if (!config_) {
-    LOG(ERROR) << "MasterchainStateQ::get_total_validator_set() : no config";
-    return {};
+td::Result<Ref<vm::Cell>> ProofQ::get_signatures_root() const {
+  if (data_.empty()) {
+    return td::Status::Error(-668, "block proof is empty");
   }
-  auto nodes = config_->compute_total_validator_set(next);
-  if (nodes.empty()) {
-    return {};
+  TRY_RESULT(root, vm::std_boc_deserialize(data_.as_slice()));
+  block::gen::BlockProof::Record proof;
+  BlockIdExt proof_blk_id;
+  if (!(tlb::unpack_cell(root, proof) && block::tlb::t_BlockIdExt.unpack(proof.proof_for.write(), proof_blk_id))) {
+    return td::Status::Error(-668, "masterchain block proof is invalid");
   }
-  return Ref<ValidatorSetQ>{true, 0, ton::ShardIdFull{}, std::move(nodes)};
+  if (proof_blk_id != id_) {
+    return td::Status::Error(-668, "masterchain block proof is for another block");
+  }
+  return proof.signatures->prefetch_ref();
+}
+
+td::Result<td::Ref<vm::Cell>> create_block_state_proof(td::Ref<vm::Cell> root) {
+  if (root.is_null()) {
+    return td::Status::Error("root is null");
+  }
+  vm::MerkleProofBuilder mpb{std::move(root)};
+  block::gen::Block::Record block;
+  if (!tlb::unpack_cell(mpb.root(), block) || block.state_update->load_cell().is_error()) {
+    return td::Status::Error("invalid block");
+  }
+  TRY_RESULT(proof, mpb.extract_proof());
+  if (proof.is_null()) {
+    return td::Status::Error("failed to create proof");
+  }
+  return proof;
+}
+
+td::Result<RootHash> unpack_block_state_proof(BlockIdExt block_id, td::Ref<vm::Cell> proof) {
+  auto virt_root = vm::MerkleProof::virtualize(proof, 1);
+  if (virt_root.is_null()) {
+    return td::Status::Error("invalid Merkle proof");
+  }
+  if (virt_root->get_hash().as_slice() != block_id.root_hash.as_slice()) {
+    return td::Status::Error("hash mismatch");
+  }
+  block::gen::Block::Record block;
+  if (!tlb::unpack_cell(virt_root, block)) {
+    return td::Status::Error("invalid block");
+  }
+  vm::CellSlice upd_cs{vm::NoVmSpec(), block.state_update};
+  if (!(upd_cs.is_special() && upd_cs.prefetch_long(8) == 4 && upd_cs.size_ext() == 0x20228)) {
+    return td::Status::Error("invalid Merkle update");
+  }
+  return upd_cs.prefetch_ref(1)->get_hash(0).bits();
 }
 
 }  // namespace validator

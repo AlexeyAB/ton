@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -32,12 +32,7 @@ class HazardPointers {
   explicit HazardPointers(size_t threads_n) : threads_(threads_n) {
     for (auto &data : threads_) {
       for (auto &ptr : data.hazard_) {
-// workaround for https://gcc.gnu.org/bugzilla/show_bug.cgi?id=64658
-#if TD_GCC && GCC_VERSION <= 40902
         ptr = nullptr;
-#else
-        std::atomic_init(&ptr, static_cast<T *>(nullptr));
-#endif
       }
     }
   }
@@ -109,14 +104,14 @@ class HazardPointers {
  private:
   struct ThreadData {
     std::array<std::atomic<T *>, MaxPointersN> hazard_;
-    char pad[TD_CONCURRENCY_PAD - sizeof(hazard_)];
+    char pad[TD_CONCURRENCY_PAD - sizeof(std::array<std::atomic<T *>, MaxPointersN>)];
 
     // stupid gc
     std::vector<std::unique_ptr<T, Deleter>> to_delete_;
-    char pad2[TD_CONCURRENCY_PAD - sizeof(to_delete_)];
+    char pad2[TD_CONCURRENCY_PAD - sizeof(std::vector<std::unique_ptr<T, Deleter>>)];
   };
   std::vector<ThreadData> threads_;
-  char pad2[TD_CONCURRENCY_PAD - sizeof(threads_)];
+  char pad2[TD_CONCURRENCY_PAD - sizeof(std::vector<ThreadData>)];
 
   template <class S>
   static S *do_protect(std::atomic<T *> &hazard_ptr, std::atomic<S *> &to_protect) {

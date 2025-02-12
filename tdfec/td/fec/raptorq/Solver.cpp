@@ -14,11 +14,12 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "td/fec/raptorq/Solver.h"
 #include "td/fec/algebra/GaussianElimination.h"
 #include "td/fec/algebra/InactivationDecoding.h"
+#include "td/utils/ThreadSafeCounter.h"
 
 #include "td/utils/Timer.h"
 #include <map>
@@ -70,6 +71,7 @@ Result<MatrixGF256> Solver::run(const Rfc::Parameters &p, Span<SymbolRef> symbol
     auto C = GaussianElimination::run(std::move(A), std::move(D));
     return C;
   }
+  TD_PERF_COUNTER(raptor_solve);
   PerfWarningTimer x("solve");
   Timer timer;
   auto perf_log = [&](Slice message) {

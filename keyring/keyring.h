@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -43,6 +43,8 @@ class Keyring : public td::actor::Actor {
                              td::Promise<std::vector<td::Result<td::BufferSlice>>> promise) = 0;
 
   virtual void decrypt_message(PublicKeyHash key_hash, td::BufferSlice data, td::Promise<td::BufferSlice> promise) = 0;
+
+  virtual void export_all_private_keys(td::Promise<std::vector<PrivateKey>> promise) = 0;
 
   static td::actor::ActorOwn<Keyring> create(std::string db_root);
 };

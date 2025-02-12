@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -22,6 +22,7 @@
 #include "ton/ton-types.h"
 #include "validator/validator.h"
 #include "rldp/rldp.h"
+#include "adnl/adnl-ext-client.h"
 
 namespace ton {
 
@@ -35,12 +36,12 @@ class DownloadBlock : public td::actor::Actor {
                 adnl::AdnlNodeIdShort download_from, td::uint32 priority, td::Timestamp timeout,
                 td::actor::ActorId<ValidatorManagerInterface> validator_manager, td::actor::ActorId<rldp::Rldp> rldp,
                 td::actor::ActorId<overlay::Overlays> overlays, td::actor::ActorId<adnl::Adnl> adnl,
-                td::Promise<ReceivedBlock> promise);
+                td::actor::ActorId<adnl::AdnlExtClient> client, td::Promise<ReceivedBlock> promise);
   DownloadBlock(BlockIdExt block_id, adnl::AdnlNodeIdShort local_id, overlay::OverlayIdShort overlay_id,
                 BlockHandle prev, adnl::AdnlNodeIdShort download_from, td::uint32 priority, td::Timestamp timeout,
                 td::actor::ActorId<ValidatorManagerInterface> validator_manager, td::actor::ActorId<rldp::Rldp> rldp,
                 td::actor::ActorId<overlay::Overlays> overlays, td::actor::ActorId<adnl::Adnl> adnl,
-                td::Promise<ReceivedBlock> promise);
+                td::actor::ActorId<adnl::AdnlExtClient> client, td::Promise<ReceivedBlock> promise);
 
   void abort_query(td::Status reason);
   void alarm() override;
@@ -48,7 +49,7 @@ class DownloadBlock : public td::actor::Actor {
 
   void start_up() override;
   void got_block_handle(BlockHandle handle);
-  void got_download_token(std::unique_ptr<DownloadToken> token);
+  void got_download_token(std::unique_ptr<ActionToken> token);
   void got_node_to_download(adnl::AdnlNodeIdShort node);
   void got_block_proof_description(td::BufferSlice proof_description);
   void got_block_proof(td::BufferSlice data);
@@ -75,6 +76,7 @@ class DownloadBlock : public td::actor::Actor {
   td::actor::ActorId<rldp::Rldp> rldp_;
   td::actor::ActorId<overlay::Overlays> overlays_;
   td::actor::ActorId<adnl::Adnl> adnl_;
+  td::actor::ActorId<adnl::AdnlExtClient> client_;
   td::Promise<ReceivedBlock> promise_;
 
   BlockHandle handle_;
@@ -84,7 +86,7 @@ class DownloadBlock : public td::actor::Actor {
 
   bool allow_partial_proof_ = false;
 
-  std::unique_ptr<DownloadToken> token_;
+  std::unique_ptr<ActionToken> token_;
 };
 
 }  // namespace fullnode

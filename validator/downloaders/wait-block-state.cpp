@@ -14,12 +14,14 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "wait-block-state.hpp"
 #include "validator/fabric.h"
 #include "ton/ton-io.hpp"
 #include "common/checksum.h"
+#include "common/delay.h"
+#include "validator/downloaders/download-state.hpp"
 
 namespace ton {
 
@@ -65,7 +67,8 @@ void WaitBlockState::start() {
   if (reading_from_db_) {
     return;
   }
-  if (handle_->received_state()) {
+  bool inited_proof = handle_->id().is_masterchain() ? handle_->inited_proof() : handle_->inited_proof_link();
+  if (handle_->received_state() && inited_proof) {
     reading_from_db_ = true;
 
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Ref<ShardState>> R) {
@@ -95,8 +98,6 @@ void WaitBlockState::start() {
     });
     td::actor::send_closure(manager_, &ValidatorManager::try_get_static_file, handle_->id().file_hash, std::move(P));
   } else if (handle_->id().id.seqno == 0) {
-    // do not try to download full chain
-    // download state + proof_link only
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::BufferSlice> R) {
       if (R.is_error()) {
         td::actor::send_closure(SelfId, &WaitBlockState::failed_to_get_state_from_net,
@@ -107,21 +108,34 @@ void WaitBlockState::start() {
     });
     td::actor::send_closure(manager_, &ValidatorManager::send_get_zero_state_request, handle_->id(), priority_,
                             std::move(P));
-  } else if (block_.is_null()) {
-    // download block and then prev state, not in reverse only
-    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Ref<BlockData>> R) {
+  } else if (check_persistent_state_desc() && !handle_->received_state()) {
+    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Ref<ShardState>> R) {
       if (R.is_error()) {
-        td::actor::send_closure(SelfId, &WaitBlockState::failed_to_get_block_data,
-                                R.move_as_error_prefix("block wait error: "));
+        LOG(WARNING) << "failed to get persistent state: " << R.move_as_error();
+        td::actor::send_closure(SelfId, &WaitBlockState::start);
       } else {
-        td::actor::send_closure(SelfId, &WaitBlockState::got_block_data, R.move_as_ok());
+        td::actor::send_closure(SelfId, &WaitBlockState::written_state, R.move_as_ok());
+      }
+    });
+    BlockIdExt masterchain_id = persistent_state_desc_->masterchain_id;
+    td::actor::create_actor<DownloadShardState>("downloadstate", handle_->id(), masterchain_id, priority_, manager_,
+                                                timeout_, std::move(P))
+        .release();
+  } else if (!handle_->inited_prev() || (!handle_->inited_proof() && !handle_->inited_proof_link())) {
+    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), handle = handle_](td::Result<td::BufferSlice> R) {
+      if (R.is_error()) {
+        delay_action([SelfId]() { td::actor::send_closure(SelfId, &WaitBlockState::after_get_proof_link); },
+                     td::Timestamp::in(0.1));
+      } else {
+        td::actor::send_closure(SelfId, &WaitBlockState::got_proof_link, R.move_as_ok());
       }
     });
 
-    td::actor::send_closure(manager_, &ValidatorManager::wait_block_data, handle_, priority_, timeout_, std::move(P));
+    waiting_proof_link_ = true;
+    td::actor::send_closure(manager_, &ValidatorManager::send_get_block_proof_link_request, handle_->id(), priority_,
+                            std::move(P));
   } else if (prev_state_.is_null()) {
     CHECK(handle_->inited_proof() || handle_->inited_proof_link());
-    CHECK(handle_->received());
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Ref<ShardState>> R) {
       if (R.is_error()) {
         td::actor::send_closure(SelfId, &WaitBlockState::failed_to_get_prev_state,
@@ -133,6 +147,30 @@ void WaitBlockState::start() {
 
     td::actor::send_closure(manager_, &ValidatorManager::wait_prev_block_state, handle_, priority_, timeout_,
                             std::move(P));
+  } else if (handle_->id().is_masterchain() && !handle_->inited_proof()) {
+    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), handle = handle_](td::Result<td::BufferSlice> R) {
+      if (R.is_error()) {
+        delay_action([SelfId]() { td::actor::send_closure(SelfId, &WaitBlockState::after_get_proof); },
+                     td::Timestamp::in(0.1));
+      } else {
+        td::actor::send_closure(SelfId, &WaitBlockState::got_proof, R.move_as_ok());
+      }
+    });
+
+    waiting_proof_ = true;
+    td::actor::send_closure(manager_, &ValidatorManager::send_get_block_proof_request, handle_->id(), priority_,
+                            std::move(P));
+  } else if (block_.is_null()) {
+    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Ref<BlockData>> R) {
+      if (R.is_error()) {
+        td::actor::send_closure(SelfId, &WaitBlockState::failed_to_get_block_data,
+                                R.move_as_error_prefix("block wait error: "));
+      } else {
+        td::actor::send_closure(SelfId, &WaitBlockState::got_block_data, R.move_as_ok());
+      }
+    });
+
+    td::actor::send_closure(manager_, &ValidatorManager::wait_block_data, handle_, priority_, timeout_, std::move(P));
   } else {
     apply();
   }
@@ -152,6 +190,46 @@ void WaitBlockState::got_prev_state(td::Ref<ShardState> state) {
   start();
 }
 
+void WaitBlockState::got_proof_link(td::BufferSlice data) {
+  if (!waiting_proof_link_) {
+    return;
+  }
+  auto R = create_proof_link(handle_->id(), std::move(data));
+  if (R.is_error()) {
+    LOG(INFO) << "received bad proof link: " << R.move_as_error();
+    start();
+    return;
+  }
+  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<BlockHandle> R) {
+    if (R.is_ok()) {
+      auto h = R.move_as_ok();
+      CHECK(h->inited_prev());
+      td::actor::send_closure(SelfId, &WaitBlockState::after_get_proof_link);
+    } else {
+      LOG(INFO) << "received bad proof link: " << R.move_as_error();
+      delay_action([SelfId]() { td::actor::send_closure(SelfId, &WaitBlockState::after_get_proof_link); },
+                   td::Timestamp::in(0.1));
+    }
+  });
+  run_check_proof_link_query(handle_->id(), R.move_as_ok(), manager_, timeout_, std::move(P));
+}
+
+void WaitBlockState::got_proof(td::BufferSlice data) {
+  if (!waiting_proof_) {
+    return;
+  }
+  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Unit> R) {
+    if (R.is_ok()) {
+      td::actor::send_closure(SelfId, &WaitBlockState::after_get_proof);
+    } else {
+      LOG(INFO) << "received bad proof link: " << R.move_as_error();
+      td::actor::send_closure(SelfId, &WaitBlockState::after_get_proof);
+    }
+  });
+  td::actor::send_closure(manager_, &ValidatorManager::validate_block_proof, handle_->id(), std::move(data),
+                          std::move(P));
+}
+
 void WaitBlockState::failed_to_get_block_data(td::Status reason) {
   if (reason.code() == ErrorCode::notready) {
     start();
@@ -167,6 +245,7 @@ void WaitBlockState::got_block_data(td::Ref<BlockData> data) {
 }
 
 void WaitBlockState::apply() {
+  TD_PERF_COUNTER(apply_block_to_state);
   td::PerfWarningTimer t{"applyblocktostate", 0.1};
   auto S = prev_state_.write().apply_block(handle_->id(), block_);
   if (S.is_error()) {

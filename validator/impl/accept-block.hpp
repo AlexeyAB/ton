@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -47,12 +47,16 @@ using td::Ref;
 class AcceptBlockQuery : public td::actor::Actor {
  public:
   struct IsFake {};
+  struct ForceFork {};
   AcceptBlockQuery(BlockIdExt id, td::Ref<BlockData> data, std::vector<BlockIdExt> prev,
-                   td::Ref<ValidatorSet> validator_set, td::Ref<BlockSignatureSet> signatures, bool send_broadcast,
+                   td::Ref<ValidatorSet> validator_set, td::Ref<BlockSignatureSet> signatures,
+                   td::Ref<BlockSignatureSet> approve_signatures, int send_broadcast_mode,
                    td::actor::ActorId<ValidatorManager> manager, td::Promise<td::Unit> promise);
   AcceptBlockQuery(IsFake fake, BlockIdExt id, td::Ref<BlockData> data, std::vector<BlockIdExt> prev,
                    td::Ref<ValidatorSet> validator_set, td::actor::ActorId<ValidatorManager> manager,
                    td::Promise<td::Unit> promise);
+  AcceptBlockQuery(ForceFork ffork, BlockIdExt id, td::Ref<BlockData> data,
+                   td::actor::ActorId<ValidatorManager> manager, td::Promise<td::Unit> promise);
 
  private:
   static constexpr td::uint32 priority() {
@@ -67,6 +71,8 @@ class AcceptBlockQuery : public td::actor::Actor {
   void written_block_data();
   void written_block_signatures();
   void got_block_handle(BlockHandle handle);
+  void got_block_candidate_data(td::BufferSlice data);
+  void got_block_handle_cont();
   void written_block_info();
   void got_block_data(td::Ref<BlockData> data);
   void got_prev_state(td::Ref<ShardState> state);
@@ -90,8 +96,10 @@ class AcceptBlockQuery : public td::actor::Actor {
   std::vector<BlockIdExt> prev_;
   Ref<ValidatorSetQ> validator_set_;
   Ref<BlockSignatureSetQ> signatures_;
+  Ref<BlockSignatureSetQ> approve_signatures_;
   bool is_fake_;
-  bool send_broadcast_;
+  bool is_fork_;
+  int send_broadcast_mode_{0};
   bool ancestors_split_{false}, is_key_block_{false};
   td::Timestamp timeout_ = td::Timestamp::in(600.0);
   td::actor::ActorId<ValidatorManager> manager_;
@@ -120,7 +128,7 @@ class AcceptBlockQuery : public td::actor::Actor {
   td::BufferSlice top_block_descr_data_;
   Ref<ShardTopBlockDescription> top_block_descr_;
 
-  td::PerfWarningTimer perf_timer_{"acceptblock", 0.1};
+  td::PerfWarningTimer perf_timer_;
 
   bool fatal_error(std::string msg, int code = -666);
   static bool check_send_error(td::actor::ActorId<AcceptBlockQuery> SelfId, td::Status error);
@@ -128,6 +136,7 @@ class AcceptBlockQuery : public td::actor::Actor {
   static bool check_send_error(td::actor::ActorId<AcceptBlockQuery> SelfId, td::Result<T>& res) {
     return res.is_error() && check_send_error(std::move(SelfId), res.move_as_error());
   }
+  bool precheck_header();
   bool create_new_proof();
   bool unpack_proof_link(BlockIdExt id, Ref<ProofLink> proof);
 

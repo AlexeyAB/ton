@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "common/refcnt.hpp"
@@ -26,12 +26,23 @@
 #include <ostream>
 #include "tl/tlblib.hpp"
 #include "td/utils/bits.h"
+#include "td/utils/CancellationToken.h"
 #include "td/utils/StringBuilder.h"
 #include "ton/ton-types.h"
 
 namespace block {
 
 using td::Ref;
+
+struct PublicKey {
+  std::string key;
+
+  static td::Result<PublicKey> from_bytes(td::Slice key);
+
+  static td::Result<PublicKey> parse(td::Slice key);
+
+  std::string serialize(bool base64_url = false);
+};
 
 struct StdAddress {
   ton::WorkchainId workchain{ton::workchainInvalid};
@@ -135,6 +146,9 @@ struct EnqueuedMsgDescr {
     return false;
   }
   bool unpack(vm::CellSlice& cs);
+  bool same_workchain() const {
+    return cur_prefix_.workchain == next_prefix_.workchain;
+  }
 };
 
 using compute_shard_end_lt_func_t = std::function<ton::LogicalTime(ton::AccountIdPrefixFull)>;
@@ -149,15 +163,24 @@ struct MsgProcessedUpto {
   MsgProcessedUpto(ton::ShardId _shard, ton::BlockSeqno _mcseqno, ton::LogicalTime _lt, td::ConstBitPtr _hash)
       : shard(_shard), mc_seqno(_mcseqno), last_inmsg_lt(_lt), last_inmsg_hash(_hash) {
   }
-  bool operator<(const MsgProcessedUpto& other) const & {
+  bool operator<(const MsgProcessedUpto& other) const& {
     return shard < other.shard || (shard == other.shard && mc_seqno < other.mc_seqno);
   }
-  bool contains(const MsgProcessedUpto& other) const &;
+  bool contains(const MsgProcessedUpto& other) const&;
   bool contains(ton::ShardId other_shard, ton::LogicalTime other_lt, td::ConstBitPtr other_hash,
-                ton::BlockSeqno other_mc_seqno) const &;
+                ton::BlockSeqno other_mc_seqno) const&;
   // NB: this is for checking whether we have already imported an internal message
   bool already_processed(const EnqueuedMsgDescr& msg) const;
+  bool can_check_processed() const {
+    return (bool)compute_shard_end_lt;
+  }
+  std::ostream& print(std::ostream& os) const;
+  std::string to_str() const;
 };
+
+static inline std::ostream& operator<<(std::ostream& os, const MsgProcessedUpto& proc) {
+  return proc.print(os);
+}
 
 struct MsgProcessedUptoCollection {
   ton::ShardIdFull owner;
@@ -183,7 +206,24 @@ struct MsgProcessedUptoCollection {
   bool combine_with(const MsgProcessedUptoCollection& other);
   // NB: this is for checking whether we have already imported an internal message
   bool already_processed(const EnqueuedMsgDescr& msg) const;
+  bool can_check_processed() const;
   bool for_each_mcseqno(std::function<bool(ton::BlockSeqno)>) const;
+  std::ostream& print(std::ostream& os) const;
+  std::string to_str() const;
+};
+
+static inline std::ostream& operator<<(std::ostream& os, const MsgProcessedUptoCollection& proc_coll) {
+  return proc_coll.print(os);
+}
+
+struct ImportedMsgQueueLimits {
+  // Default values
+  td::uint32 max_bytes = 1 << 16;
+  td::uint32 max_msgs = 30;
+  bool deserialize(vm::CellSlice& cs);
+  ImportedMsgQueueLimits operator*(td::uint32 x) const {
+    return {max_bytes * x, max_msgs * x};
+  }
 };
 
 struct ParamLimits {
@@ -209,6 +249,12 @@ struct ParamLimits {
   bool deserialize(vm::CellSlice& cs);
   int classify(td::uint64 value) const;
   bool fits(unsigned cls, td::uint64 value) const;
+  void multiply_by(double x) {
+    CHECK(x > 0.0);
+    for (td::uint32& y : limits_) {
+      y = (td::uint32)std::min<double>(y * x, 1e9);
+    }
+  }
 
  private:
   std::array<td::uint32, limits_cnt> limits_;
@@ -231,7 +277,8 @@ struct BlockLimitStatus {
   ton::LogicalTime cur_lt;
   td::uint64 gas_used{};
   vm::NewCellStorageStat st_stat;
-  unsigned accounts{}, transactions{};
+  unsigned accounts{}, transactions{}, extra_out_msgs{};
+  unsigned public_library_diff{};
   BlockLimitStatus(const BlockLimits& limits_, ton::LogicalTime lt = 0)
       : limits(limits_), cur_lt(std::max(limits_.start_lt, lt)) {
   }
@@ -240,6 +287,8 @@ struct BlockLimitStatus {
     st_stat.set_zero();
     transactions = accounts = 0;
     gas_used = 0;
+    extra_out_msgs = 0;
+    public_library_diff = 0;
   }
   td::uint64 estimate_block_size(const vm::NewCellStorageStat::Stat* extra = nullptr) const;
   int classify() const;
@@ -309,8 +358,8 @@ struct CurrencyCollection {
     grams.clear();
     return false;
   }
-  bool validate() const;
-  bool validate_extra() const;
+  bool validate(int max_cells = 1024) const;
+  bool validate_extra(int max_cells = 1024) const;
   bool operator==(const CurrencyCollection& other) const;
   bool operator!=(const CurrencyCollection& other) const {
     return !operator==(other);
@@ -341,12 +390,13 @@ struct CurrencyCollection {
   CurrencyCollection operator-(const CurrencyCollection& other) const;
   CurrencyCollection operator-(CurrencyCollection&& other) const;
   CurrencyCollection operator-(td::RefInt256 other_grams) const;
+  bool clamp(const CurrencyCollection& other);
   bool store(vm::CellBuilder& cb) const;
   bool store_or_zero(vm::CellBuilder& cb) const;
   bool fetch(vm::CellSlice& cs);
   bool fetch_exact(vm::CellSlice& cs);
   bool unpack(Ref<vm::CellSlice> csr);
-  bool validate_unpack(Ref<vm::CellSlice> csr);
+  bool validate_unpack(Ref<vm::CellSlice> csr, int max_cells = 1024);
   Ref<vm::CellSlice> pack() const;
   bool pack_to(Ref<vm::CellSlice>& csr) const {
     return (csr = pack()).not_null();
@@ -371,7 +421,7 @@ struct ShardState {
   int global_id_;
   ton::UnixTime utime_;
   ton::LogicalTime lt_;
-  ton::BlockSeqno mc_blk_seqno_, min_ref_mc_seqno_;
+  ton::BlockSeqno mc_blk_seqno_, min_ref_mc_seqno_, vert_seqno_;
   ton::BlockIdExt mc_blk_ref_;
   ton::LogicalTime mc_blk_lt_;
   bool before_split_{false};
@@ -382,7 +432,10 @@ struct ShardState {
   CurrencyCollection total_balance_, total_validator_fees_, global_balance_;
   std::unique_ptr<vm::AugmentedDictionary> out_msg_queue_;
   std::unique_ptr<vm::Dictionary> ihr_pending_;
+  std::unique_ptr<vm::Dictionary> block_create_stats_;
   std::shared_ptr<block::MsgProcessedUptoCollection> processed_upto_;
+  std::unique_ptr<vm::AugmentedDictionary> dispatch_queue_;
+  td::optional<td::uint64> out_msg_queue_size_;
 
   bool is_valid() const {
     return id_.is_valid();
@@ -424,7 +477,7 @@ struct ShardState {
 struct ValueFlow {
   struct SetZero {};
   CurrencyCollection from_prev_blk, to_next_blk, imported, exported, fees_collected, fees_imported, recovered, created,
-      minted;
+      minted, burned;
   ValueFlow() = default;
   ValueFlow(SetZero)
       : from_prev_blk{0}
@@ -435,7 +488,8 @@ struct ValueFlow {
       , fees_imported{0}
       , recovered{0}
       , created{0}
-      , minted{0} {
+      , minted{0}
+      , burned{0} {
   }
   bool is_valid() const {
     return from_prev_blk.is_valid() && minted.is_valid();
@@ -457,30 +511,172 @@ struct ValueFlow {
 
 std::ostream& operator<<(std::ostream& os, const ValueFlow& vflow);
 
-struct BlkProofLink {
+struct DiscountedCounter {
+  struct SetZero {};
+  bool valid;
+  ton::UnixTime last_updated;
+  td::uint64 total;
+  td::uint64 cnt2048;
+  td::uint64 cnt65536;
+  DiscountedCounter() : valid(false) {
+  }
+  DiscountedCounter(SetZero) : valid(true), last_updated(0), total(0), cnt2048(0), cnt65536(0) {
+  }
+  DiscountedCounter(ton::UnixTime _lastupd, td::uint64 _total, td::uint64 _cnt2048, td::uint64 _cnt65536)
+      : valid(true), last_updated(_lastupd), total(_total), cnt2048(_cnt2048), cnt65536(_cnt65536) {
+  }
+  static DiscountedCounter Zero() {
+    return SetZero();
+  }
+  bool is_valid() const {
+    return valid;
+  }
+  bool invalidate() {
+    return (valid = false);
+  }
+  bool set_zero() {
+    last_updated = 0;
+    total = cnt2048 = cnt65536 = 0;
+    return (valid = true);
+  }
+  bool is_zero() const {
+    return !total;
+  }
+  bool almost_zero() const {
+    return (cnt2048 | cnt65536) <= 1;
+  }
+  bool operator==(const DiscountedCounter& other) const {
+    return last_updated == other.last_updated && total == other.total && cnt2048 == other.cnt2048 &&
+           cnt65536 == other.cnt65536;
+  }
+  bool almost_equals(const DiscountedCounter& other) const {
+    return last_updated == other.last_updated && total == other.total && cnt2048 <= other.cnt2048 + 1 &&
+           other.cnt2048 <= cnt2048 + 1 && cnt65536 <= other.cnt65536 + 1 && other.cnt65536 <= cnt65536 + 1;
+  }
+  bool modified_since(ton::UnixTime utime) const {
+    return last_updated >= utime;
+  }
+  bool validate();
+  bool increase_by(unsigned count, ton::UnixTime now);
+  bool fetch(vm::CellSlice& cs);
+  bool unpack(Ref<vm::CellSlice> csr);
+  bool store(vm::CellBuilder& cb) const;
+  Ref<vm::CellSlice> pack() const;
+  bool show(std::ostream& os) const;
+  std::string to_str() const;
+};
+
+static inline std::ostream& operator<<(std::ostream& os, const DiscountedCounter& dcount) {
+  dcount.show(os);
+  return os;
+}
+
+bool fetch_CreatorStats(vm::CellSlice& cs, DiscountedCounter& mc_cnt, DiscountedCounter& shard_cnt);
+bool store_CreatorStats(vm::CellBuilder& cb, const DiscountedCounter& mc_cnt, const DiscountedCounter& shard_cnt);
+bool unpack_CreatorStats(Ref<vm::CellSlice> cs, DiscountedCounter& mc_cnt, DiscountedCounter& shard_cnt);
+
+struct BlockProofLink {
   ton::BlockIdExt from, to;
   bool is_key{false}, is_fwd{false};
-  Ref<vm::Cell> dest_proof, shard_proof, proof;
+  Ref<vm::Cell> dest_proof, state_proof, proof;
   ton::CatchainSeqno cc_seqno{0};
   td::uint32 validator_set_hash{0};
   std::vector<ton::BlockSignature> signatures;
-  BlkProofLink(ton::BlockIdExt _from, ton::BlockIdExt _to, bool _iskey = false)
+  BlockProofLink(ton::BlockIdExt _from, ton::BlockIdExt _to, bool _iskey = false)
       : from(_from), to(_to), is_key(_iskey), is_fwd(to.seqno() > from.seqno()) {
   }
+  bool incomplete() const {
+    return dest_proof.is_null();
+  }
+  td::Status validate(td::uint32* save_utime = nullptr) const;
 };
 
-struct BlkProofChain {
+struct BlockProofChain {
   ton::BlockIdExt from, to;
   int mode;
-  std::vector<BlkProofLink> links;
+  td::uint32 last_utime{0};
+  bool complete{false}, has_key_block{false}, has_utime{false}, valid{false};
+  ton::BlockIdExt key_blkid;
+  std::vector<BlockProofLink> links;
   std::size_t link_count() const {
     return links.size();
   }
-  BlkProofChain(ton::BlockIdExt _from, ton::BlockIdExt _to, int _mode) : from(_from), to(_to), mode(_mode) {
+  BlockProofChain(ton::BlockIdExt _from, ton::BlockIdExt _to, int _mode = 0) : from(_from), to(_to), mode(_mode) {
   }
+  BlockProofLink& new_link(const ton::BlockIdExt& cur, const ton::BlockIdExt& next, bool iskey = false) {
+    links.emplace_back(cur, next, iskey);
+    return links.back();
+  }
+  const BlockProofLink& last_link() const {
+    return links.back();
+  }
+  BlockProofLink& last_link() {
+    return links.back();
+  }
+  bool last_link_incomplete() const {
+    return !links.empty() && last_link().incomplete();
+  }
+  td::Status validate(td::CancellationToken cancellation_token = {});
 };
 
-int filter_out_msg_queue(vm::AugmentedDictionary& out_queue, ton::ShardIdFull old_shard, ton::ShardIdFull subshard);
+// compute the share of shardchain blocks generated by each validator using Monte Carlo method
+class MtCarloComputeShare {
+  int K, N;
+  long long iterations;
+  std::vector<double> W;
+  std::vector<double> CW, RW;
+  std::vector<std::pair<double, double>> H;
+  std::vector<int> A;
+  double R0;
+  bool ok;
+
+ public:
+  MtCarloComputeShare(int subset_size, const std::vector<double>& weights, long long iteration_count = 1000000)
+      : K(subset_size), N((int)weights.size()), iterations(iteration_count), W(weights), ok(false) {
+    compute();
+  }
+  MtCarloComputeShare(int subset_size, int set_size, const double* weights, long long iteration_count = 1000000)
+      : K(subset_size), N(set_size), iterations(iteration_count), W(weights, weights + set_size), ok(false) {
+    compute();
+  }
+  bool is_ok() const {
+    return ok;
+  }
+  const double* share_array() const {
+    return ok ? RW.data() : nullptr;
+  }
+  const double* weights_array() const {
+    return ok ? W.data() : nullptr;
+  }
+  double operator[](int i) const {
+    return ok ? RW.at(i) : -1.;
+  }
+  double share(int i) const {
+    return ok ? RW.at(i) : -1.;
+  }
+  double weight(int i) const {
+    return ok ? W.at(i) : -1.;
+  }
+  int size() const {
+    return N;
+  }
+  int subset_size() const {
+    return K;
+  }
+  long long performed_iterations() const {
+    return iterations;
+  }
+
+ private:
+  bool set_error() {
+    return ok = false;
+  }
+  bool compute();
+  void gen_vset();
+};
+
+int filter_out_msg_queue(vm::AugmentedDictionary& out_queue, ton::ShardIdFull old_shard, ton::ShardIdFull subshard,
+                         td::uint64* queue_size = nullptr);
 
 std::ostream& operator<<(std::ostream& os, const ShardId& shard_id);
 
@@ -506,7 +702,8 @@ bool unpack_CurrencyCollection(Ref<vm::CellSlice> csr, td::RefInt256& value, Ref
 bool valid_library_collection(Ref<vm::Cell> cell, bool catch_errors = true);
 
 bool valid_config_data(Ref<vm::Cell> cell, const td::BitArray<256>& addr, bool catch_errors = true,
-                       bool relax_par0 = false);
+                       bool relax_par0 = false, Ref<vm::Cell> old_mparams = {});
+bool config_params_present(vm::Dictionary& dict, Ref<vm::Cell> param_dict_root);
 
 bool add_extra_currency(Ref<vm::Cell> extra1, Ref<vm::Cell> extra2, Ref<vm::Cell>& res);
 bool sub_extra_currency(Ref<vm::Cell> extra1, Ref<vm::Cell> extra2, Ref<vm::Cell>& res);
@@ -529,6 +726,10 @@ td::Status unpack_block_prev_blk_ext(Ref<vm::Cell> block_root, const ton::BlockI
 td::Status unpack_block_prev_blk_try(Ref<vm::Cell> block_root, const ton::BlockIdExt& id,
                                      std::vector<ton::BlockIdExt>& prev, ton::BlockIdExt& mc_blkid, bool& after_split,
                                      ton::BlockIdExt* fetch_blkid = nullptr);
+td::Status check_block_header(Ref<vm::Cell> block_root, const ton::BlockIdExt& id,
+                              ton::Bits256* store_shard_hash_to = nullptr);
+
+std::unique_ptr<vm::Dictionary> get_block_create_stats_dict(Ref<vm::Cell> state_root);
 
 std::unique_ptr<vm::AugmentedDictionary> get_prev_blocks_dict(Ref<vm::Cell> state_root);
 bool get_old_mc_block_id(vm::AugmentedDictionary* prev_blocks_dict, ton::BlockSeqno seqno, ton::BlockIdExt& blkid,
@@ -565,5 +766,26 @@ bool parse_hex_hash(td::Slice str, td::Bits256& hash);
 
 bool parse_block_id_ext(const char* str, const char* end, ton::BlockIdExt& blkid);
 bool parse_block_id_ext(td::Slice str, ton::BlockIdExt& blkid);
+
+bool unpack_account_dispatch_queue(Ref<vm::CellSlice> csr, vm::Dictionary& dict, td::uint64& dict_size);
+Ref<vm::CellSlice> pack_account_dispatch_queue(const vm::Dictionary& dict, td::uint64 dict_size);
+Ref<vm::CellSlice> get_dispatch_queue_min_lt_account(const vm::AugmentedDictionary& dispatch_queue,
+                                                     ton::StdSmcAddress& addr);
+bool remove_dispatch_queue_entry(vm::AugmentedDictionary& dispatch_queue, const ton::StdSmcAddress& addr,
+                                 ton::LogicalTime lt);
+
+struct MsgMetadata {
+  td::uint32 depth;
+  ton::WorkchainId initiator_wc;
+  ton::StdSmcAddress initiator_addr;
+  ton::LogicalTime initiator_lt;
+
+  bool unpack(vm::CellSlice& cs);
+  bool pack(vm::CellBuilder& cb) const;
+  std::string to_str() const;
+
+  bool operator==(const MsgMetadata& other) const;
+  bool operator!=(const MsgMetadata& other) const;
+};
 
 }  // namespace block

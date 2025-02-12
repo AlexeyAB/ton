@@ -33,10 +33,8 @@ class ClientKotlin {
 @SmallTest
 class TonTest {
     val config = """{
-  "@type": "config.global",
-  "liteclients": [
+  "liteservers": [
     {
-      "@type": "liteclient.config.global",
       "ip": 1137658550,
       "port": 4924,
       "id": {
@@ -44,35 +42,43 @@ class TonTest {
         "key": "peJTw/arlRfssgTuf9BMypJzqOi7SXEqSPSWiEw2U1M="
       }
     }
-  ]
+  ],
+  "validator": {
+    "@type": "validator.config.global",
+    "zero_state": {
+      "workchain": -1,
+      "shard": -9223372036854775808,
+      "seqno": 0,
+      "root_hash": "F6OpKZKqvqeFp6CQmFomXNMfMj2EnaUSOXN+Mh+wVWk=",
+      "file_hash": "XplPz01CXAps5qeSWUtxcyBfdAo5zVb1N979KLSKD24="
+    }
+  }
 }"""
     @Test
     fun createTestWallet() {
         val client = ClientKotlin()
         val dir = getContext().getExternalFilesDir(null).toString() + "/";
+        val words = getContext().getString(R.string.wallet_mnemonic_words).split(" ").toTypedArray();
         runBlocking {
-            client.send(TonApi.Init(TonApi.Options(config, dir)))
-            val key = client.send(TonApi.CreateNewKey("local password".toByteArray(), "mnemonic password".toByteArray())) as TonApi.Key
-            val walletAddress = client.send(TonApi.TestWalletGetAccountAddress(TonApi.TestWalletInitialAccountState(key.publicKey))) as TonApi.AccountAddress;
-            val testGiverState = client.send(TonApi.TestGiverGetAccountState()) as TonApi.TestGiverAccountState
+            val info = client.send(TonApi.Init(TonApi.Options(TonApi.Config(config, "", false, false), TonApi.KeyStoreTypeDirectory(dir)))) as TonApi.OptionsInfo;
+            val key = client.send(TonApi.CreateNewKey("local password".toByteArray(), "mnemonic password".toByteArray(), "".toByteArray())) as TonApi.Key
+            val inputKey = TonApi.InputKeyRegular(key, "local password".toByteArray())
+            val walletAddress = client.send(TonApi.GetAccountAddress(TonApi.WalletV3InitialAccountState(key.publicKey, info.configInfo.defaultWalletId), 1)) as TonApi.AccountAddress
 
-            client.send(TonApi.TestGiverSendGrams(walletAddress, testGiverState.seqno, 6660000000)) as TonApi.Ok
+            val giverKey = client.send(TonApi.ImportKey("local password".toByteArray(), "".toByteArray(), TonApi.ExportedKey(words))) as TonApi.Key
+            val giverInputKey = TonApi.InputKeyRegular(giverKey, "local password".toByteArray())
+            val giverAddress = client.send(TonApi.GetAccountAddress(TonApi.WalletV3InitialAccountState(giverKey.publicKey, info.configInfo.defaultWalletId), 1)) as TonApi.AccountAddress;
 
-            while ((client.send(TonApi.GenericGetAccountState(walletAddress)) as TonApi.GenericAccountStateUninited).accountState.balance <= 0L) {
+            val queryInfo = client.send(TonApi.CreateQuery(giverInputKey, giverAddress, 60, TonApi.ActionMsg(arrayOf(TonApi.MsgMessage(walletAddress, inputKey.key.publicKey, 6660000000, TonApi.MsgDataDecryptedText("Helo".toByteArray()) )), true))) as TonApi.QueryInfo;
+            client.send(TonApi.QuerySend(queryInfo.id)) as TonApi.Ok;
+
+            while ((client.send(TonApi.GetAccountState(walletAddress)) as TonApi.FullAccountState).balance <= 0L) {
                 delay(1000L)
             }
 
-            val inputKey = TonApi.InputKey(key, "local password".toByteArray());
-            client.send(TonApi.TestWalletInit(inputKey)) as TonApi.Ok
-
-            while (client.send(TonApi.GenericGetAccountState(walletAddress)) !is TonApi.GenericAccountStateTestWallet) {
-                delay(1000L)
-            }
-
-            val state = client.send(TonApi.GenericGetAccountState(walletAddress)) as TonApi.GenericAccountStateTestWallet
-            val balance = state.accountState.balance
-            client.send(TonApi.GenericSendGrams(inputKey, walletAddress, walletAddress, 10)) as TonApi.Ok
-            while ((client.send(TonApi.GenericGetAccountState(walletAddress)) as TonApi.GenericAccountStateTestWallet).accountState.balance == balance) {
+            val queryInfo2 = client.send(TonApi.CreateQuery(inputKey, walletAddress, 60, TonApi.ActionMsg(arrayOf(), true))) as TonApi.QueryInfo;
+            client.send(TonApi.QuerySend(queryInfo2.id)) as TonApi.Ok;
+            while ((client.send(TonApi.GetAccountState(walletAddress)) as TonApi.FullAccountState).accountState !is TonApi.WalletV3AccountState) {
                 delay(1000L)
             }
         }
